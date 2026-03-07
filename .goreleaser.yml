@@ -1,0 +1,83 @@
+version: 2
+
+project_name: ttl
+
+builds:
+  - main: ./cmd/ttl
+    binary: ttl
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    env:
+      - CGO_ENABLED=0
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+universal_binaries:
+  - replace: true
+
+archives:
+  - formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENCE
+      - README.md
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+
+checksum:
+  name_template: "checksums.txt"
+
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    args:
+      - "sign-blob"
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
+
+release:
+  github:
+    owner: tweenietomatoes
+    name: ttl
+
+homebrew_casks:
+  - name: ttl
+    binaries:
+      - ttl
+    repository:
+      owner: tweenietomatoes
+      name: homebrew-ttl
+      token: "{{ .Env.REPO_PUBLISH_TOKEN }}"
+    homepage: "https://ttl.space"
+    description: "E2E Encrypted Ephemeral Storage"
+    commit_msg_template: "update {{ .ProjectName }} to {{ .Tag }}"
+    commit_author:
+      name: tweenietomatoes
+      email: emre@temelkuran.ist
+
+scoops:
+  - name: ttl
+    repository:
+      owner: tweenietomatoes
+      name: scoop-ttl
+      token: "{{ .Env.REPO_PUBLISH_TOKEN }}"
+    homepage: "https://ttl.space"
+    description: "E2E Encrypted Ephemeral Storage"
+    license: "MIT"
+    commit_msg_template: "update {{ .ProjectName }} to {{ .Tag }}"
+    commit_author:
+      name: tweenietomatoes
+      email: emre@temelkuran.ist

@@ -1,0 +1,30 @@
+# Build output
+/ttl
+/dist/
+*.exe
+
+# Test artifacts
+*.test
+*.out
+coverage.txt
+
+# Go workspace
+go.work.sum
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.vscode/
+.idea/
+.claude/
+*.swp
+*~
+
+# Environment
+.env
+
+# Project-specific
+/disardatut/
+*.bin

@@ -246,7 +246,7 @@ func TestCLI_Send_TTL_HeaderSent(t *testing.T) {
 	}
 }
 
-func TestCLI_Send_TTL_DefaultIs24h(t *testing.T) {
+func TestCLI_Send_TTL_DefaultIs7d(t *testing.T) {
 	var gotTTL string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotTTL = r.Header.Get("X-TTL")
@@ -260,8 +260,8 @@ func TestCLI_Send_TTL_DefaultIs24h(t *testing.T) {
 	if err := runSend([]string{"-p", "12345678", "-server", srv.URL, f}); err != nil {
 		t.Fatal(err)
 	}
-	if gotTTL != "86400" {
-		t.Fatalf("expected default X-TTL=86400 (24h), got %q", gotTTL)
+	if gotTTL != "604800" {
+		t.Fatalf("expected default X-TTL=604800 (7d), got %q", gotTTL)
 	}
 }
 

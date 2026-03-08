@@ -447,7 +447,7 @@ func TestAttack_TTL_ExhaustiveInvalid(t *testing.T) {
 		"7m", "8m", "9m", "11m", "20m", "45m", "60m",
 		"0h", "4h", "5h", "7h", "8h", "9h", "10h", "11h",
 		"13h", "18h", "36h", "48h", "72h", "168h",
-		"1s", "1d", "1w", "1y",
+		"1s", "1w", "1y", "8d", "14d", "30d",
 		"5M", "1H", "24H", // wrong case
 		"-5m", "-1h",
 		"5m ", " 5m", " 5m ", // whitespace

@@ -101,7 +101,7 @@ ttl version
 | Flag | Description |
 |------|-------------|
 | `-p, --password P` | Encryption / decryption password |
-| `-t, --ttl DUR` | Time to live: `5m` `10m` `15m` `30m` `1h` `2h` `3h` `6h` `12h` `24h` (default: `24h`) |
+| `-t, --ttl DUR` | Time to live: `5m` `10m` `15m` `30m` `1h` `2h` `3h` `6h` `12h` `24h` `1d` `2d` `3d` `4d` `5d` `6d` `7d` (default: `7d`) |
 | `-b, --burn` | Burn after reading — deleted after first download |
 | `-o, --output DIR` | Output directory (default: current directory) |
 | `--timeout D` | Transfer timeout (e.g. `5m`, `1h`). Default: auto |
@@ -112,16 +112,25 @@ ttl version
 
 ## 💡 Examples
 
-Custom password with a 1-hour TTL:
+Quick share with custom password — expires in 5 minutes:
 
 ```
-ttl send -p mySecretPass -t 1h document.pdf
+ttl send -p mySecret -t 5m credentials.txt
 ```
 
-Burn after reading with a 5-minute window:
+Send with various TTL durations:
 
 ```
-ttl send -b -t 5m notes.txt
+ttl send -t 5m credentials.txt              # expires in 5 minutes
+ttl send -t 1h document.pdf                 # expires in 1 hour
+ttl send -t 3d project-archive.tar.gz       # expires in 3 days
+ttl send report.xlsx                        # expires in 7 days (default)
+```
+
+Burn after reading — file is permanently deleted after the first download:
+
+```
+ttl send -b confidential.pdf
 ```
 
 Download to a specific directory:
@@ -130,13 +139,13 @@ Download to a specific directory:
 ttl get -o ~/Downloads aBcDeFgHiJ
 ```
 
-Scripting — password from stdin:
+Scripting — password from stdin (no terminal prompt):
 
 ```
 echo "mySecretPass" | ttl send --password-stdin backup.tar.gz
 ```
 
-Password from a file (useful for Docker secrets):
+Password from a file (useful for CI/CD and Docker secrets):
 
 ```
 ttl send --password-file /run/secrets/pw backup.tar.gz
@@ -202,7 +211,7 @@ This ensures only properly encrypted files are stored, even if a client is buggy
 | Limit | Value |
 |-------|-------|
 | Max file size | 256 MB |
-| Max retention | 24 hours |
+| Max retention | 7 days |
 | Uploads per IP | 10 per day, min 3 seconds apart |
 | Requests per IP | 30 per 10 seconds |
 | Min password | 8 characters |

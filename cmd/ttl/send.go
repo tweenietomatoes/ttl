@@ -30,7 +30,9 @@ const maxFileBytes = crypto.MaxFileBytes
 var labelToSeconds = map[string]int{
 	"5m": 300, "10m": 600, "15m": 900, "30m": 1800,
 	"1h": 3600, "2h": 7200, "3h": 10800, "6h": 21600,
-	"12h": 43200, "24h": 86400,
+	"12h": 43200, "24h": 86400, "1d": 86400, "2d": 172800,
+	"3d": 259200, "4d": 345600, "5d": 432000, "6d": 518400,
+	"7d": 604800,
 }
 
 func runSend(args []string) error {
@@ -47,8 +49,8 @@ func runSend(args []string) error {
 	fs.StringVar(&passwordFileVal, "password-file", "", "read from file")
 
 	var ttlVal string
-	fs.StringVar(&ttlVal, "t", "24h", "time to live")
-	fs.StringVar(&ttlVal, "ttl", "24h", "time to live")
+	fs.StringVar(&ttlVal, "t", "7d", "time to live")
+	fs.StringVar(&ttlVal, "ttl", "7d", "time to live")
 
 	var burnVal bool
 	fs.BoolVar(&burnVal, "b", false, "burn after reading (single download)")
@@ -372,7 +374,7 @@ func generatePassword(length int) (string, error) {
 func parseTTL(label string) (int, error) {
 	seconds, ok := labelToSeconds[label]
 	if !ok {
-		return 0, fmt.Errorf("invalid duration: %s (use 5m,10m,15m,30m,1h,2h,3h,6h,12h,24h)", label)
+		return 0, fmt.Errorf("invalid duration: %s (use 5m,10m,15m,30m,1h,2h,3h,6h,12h,24h,1d,2d,3d,4d,5d,6d,7d)", label)
 	}
 	return seconds, nil
 }

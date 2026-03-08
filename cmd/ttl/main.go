@@ -61,7 +61,7 @@ func printUsage() {
 files are encrypted on your device before upload.
 the server never sees your data or password.
 passwords are auto-generated during send if not provided.
-default time to live is 24 hours. progress is shown during transfer.
+default time to live is 7 days. progress is shown during transfer.
 
 usage:
   ttl send [-p P | --password P | --password-stdin | --password-file F] [-t DUR] [-b] [--timeout D] FILE
@@ -70,7 +70,7 @@ usage:
 
 options:
   -p, --password P       encryption/decryption password
-  -t, --ttl DUR          time to live: 5m,10m,15m,30m,1h,2h,3h,6h,12h,24h (default: 24h)
+  -t, --ttl DUR          time to live: 5m,10m,15m,30m,1h,2h,3h,6h,12h,24h,1d,2d,3d,4d,5d,6d,7d (default: 7d)
   -b, --burn             burn after reading (file is deleted after first download)
   -o, --output DIR       output directory for downloaded file (default: current directory)
   --timeout D            transfer timeout (e.g. 5m, 1h). default: auto (assumes 1 Mbps)

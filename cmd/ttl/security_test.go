@@ -676,10 +676,7 @@ func TestAttack_E2E_UploadDownloadRoundTrip(t *testing.T) {
 func TestAttack_RandomBytes_NonDeterministic(t *testing.T) {
 	seen := make(map[string]bool)
 	for i := 0; i < 1000; i++ {
-		b, err := randomBytes(16)
-		if err != nil {
-			t.Fatal(err)
-		}
+		b := randomBytes(16)
 		key := string(b)
 		if seen[key] {
 			t.Fatal("randomBytes returned duplicate value!")
@@ -691,10 +688,7 @@ func TestAttack_RandomBytes_NonDeterministic(t *testing.T) {
 // TestAttack_RandomBytes_Length checks that the returned slice has the requested length.
 func TestAttack_RandomBytes_Length(t *testing.T) {
 	for _, length := range []int{1, 8, 16, 24, 32, 64, 256, 1024} {
-		b, err := randomBytes(length)
-		if err != nil {
-			t.Fatal(err)
-		}
+		b := randomBytes(length)
 		if len(b) != length {
 			t.Fatalf("randomBytes(%d) returned %d bytes", length, len(b))
 		}

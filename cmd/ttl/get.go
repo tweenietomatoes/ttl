@@ -93,7 +93,7 @@ func runGet(args []string) error {
 			fmt.Fprintln(os.Stderr, "\nh3: falling back to tcp")
 			probeCancel()
 			probeCtx, probeCancel = context.WithTimeout(context.Background(), probeTimeout)
-			defer probeCancel()
+			defer probeCancel() // required by go vet
 			probeResp, err = doProbe(newTCPClient(probeTimeout))
 		}
 	} else {
@@ -175,7 +175,7 @@ func runGet(args []string) error {
 			fmt.Fprintln(os.Stderr, "\nh3: falling back to tcp")
 			dlCancel()
 			dlCtx, dlCancel = context.WithTimeout(context.Background(), xferTimeout)
-			defer dlCancel()
+			defer dlCancel() // required by go vet
 			resp, err = doGet(newTCPClient(xferTimeout))
 		}
 	} else {

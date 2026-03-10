@@ -102,10 +102,7 @@ func runSend(args []string) error {
 		return err
 	}
 
-	salt, err := randomBytes(crypto.SaltSize)
-	if err != nil {
-		return err
-	}
+	salt := randomBytes(crypto.SaltSize)
 	key := crypto.DeriveEncKey(pass, salt)
 	downloadToken := crypto.DeriveDownloadToken(key)
 	tokenHash := crypto.TokenHash(downloadToken)
@@ -169,7 +166,7 @@ func runSend(args []string) error {
 			<-errCh
 
 			ctx, cancel = context.WithTimeout(context.Background(), xferTimeout)
-			defer cancel()
+			defer cancel() // required by go vet; first defer calls this value too
 			pr, pw = io.Pipe()
 			errCh = make(chan error, 1)
 			if _, seekErr := f.Seek(0, io.SeekStart); seekErr != nil {
@@ -392,12 +389,10 @@ func humanBytes(b int64) string {
 	}
 }
 
-func randomBytes(n int) ([]byte, error) {
+func randomBytes(n int) []byte {
 	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		return nil, fmt.Errorf("random generation failed: %w", err)
-	}
-	return b, nil
+	rand.Read(b)
+	return b
 }
 
 // handleUploadError maps HTTP error responses to upload-specific messages.

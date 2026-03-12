@@ -487,8 +487,8 @@ func TestAttack_FileSizeEdgeCases(t *testing.T) {
 	if err == nil {
 		t.Fatal("empty file should be rejected")
 	}
-	if !strings.Contains(err.Error(), "file is empty") {
-		t.Fatalf("expected 'file is empty' error, got: %v", err)
+	if !strings.Contains(err.Error(), "File is empty") {
+		t.Fatalf("expected 'File is empty' error, got: %v", err)
 	}
 
 	// Test with 1-byte file

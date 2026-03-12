@@ -248,7 +248,7 @@ func TestCLI_Get_PasswordShortFlag(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected network error, not nil")
 	}
-	if strings.Contains(err.Error(), "password") {
+	if strings.Contains(strings.ToLower(err.Error()), "password") {
 		t.Fatalf("-p flag should be accepted, but got: %v", err)
 	}
 }
@@ -258,7 +258,7 @@ func TestCLI_Get_PasswordLongFlag(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected network error")
 	}
-	if strings.Contains(err.Error(), "password") {
+	if strings.Contains(strings.ToLower(err.Error()), "password") {
 		t.Fatalf("-password flag should be accepted, but got: %v", err)
 	}
 }
@@ -269,7 +269,7 @@ func TestCLI_Get_OutputShortFlag(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected network error")
 	}
-	if strings.Contains(err.Error(), "output directory") || strings.Contains(err.Error(), "not a directory") {
+	if strings.Contains(err.Error(), "Output directory") || strings.Contains(err.Error(), "Not a directory") {
 		t.Fatalf("-o flag should accept a valid directory, but got: %v", err)
 	}
 }
@@ -280,7 +280,7 @@ func TestCLI_Get_OutputLongFlag(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected network error")
 	}
-	if strings.Contains(err.Error(), "output directory") || strings.Contains(err.Error(), "not a directory") {
+	if strings.Contains(err.Error(), "Output directory") || strings.Contains(err.Error(), "Not a directory") {
 		t.Fatalf("-output flag should accept a valid directory, but got: %v", err)
 	}
 }
@@ -309,7 +309,7 @@ func TestCLI_Get_FullURL(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected network error")
 	}
-	if strings.Contains(err.Error(), "invalid") && strings.Contains(err.Error(), "token") {
+	if strings.Contains(err.Error(), "Invalid") && strings.Contains(err.Error(), "token") {
 		t.Fatalf("full URL should be accepted, got: %v", err)
 	}
 }
@@ -350,8 +350,8 @@ func TestCLI_Get_500(t *testing.T) {
 	if err == nil {
 		t.Fatal("500 should cause an error")
 	}
-	if !strings.Contains(err.Error(), "server error") {
-		t.Fatalf("expected 'server error', got: %v", err)
+	if !strings.Contains(err.Error(), "Server error") {
+		t.Fatalf("expected 'Server error', got: %v", err)
 	}
 }
 

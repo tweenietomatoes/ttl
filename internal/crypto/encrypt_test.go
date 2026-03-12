@@ -48,7 +48,7 @@ func TestEncryptDecrypt_RoundTrip(t *testing.T) {
 
 	encrypted := encryptToBuffer(t, original, "hello.txt", password)
 
-	filename, written, err := DecryptStream(bytes.NewReader(encrypted), password, ".")
+	_, filename, written, err := DecryptStream(bytes.NewReader(encrypted), password, ".")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestEncryptDecrypt_0Byte(t *testing.T) {
 
 	encrypted := encryptToBuffer(t, []byte{}, "empty.txt", password)
 
-	filename, written, err := DecryptStream(bytes.NewReader(encrypted), password, ".")
+	_, filename, written, err := DecryptStream(bytes.NewReader(encrypted), password, ".")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestEncryptDecrypt_ExactChunk(t *testing.T) {
 
 	encrypted := encryptToBuffer(t, original, "exact.bin", password)
 
-	filename, written, err := DecryptStream(bytes.NewReader(encrypted), password, ".")
+	_, filename, written, err := DecryptStream(bytes.NewReader(encrypted), password, ".")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestEncryptDecrypt_MultiChunk(t *testing.T) {
 
 	encrypted := encryptToBuffer(t, original, "multi.bin", password)
 
-	filename, written, err := DecryptStream(bytes.NewReader(encrypted), password, ".")
+	_, filename, written, err := DecryptStream(bytes.NewReader(encrypted), password, ".")
 	if err != nil {
 		t.Fatal(err)
 	}

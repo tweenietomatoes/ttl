@@ -36,21 +36,20 @@ func runGet(args []string) error {
 	var outDirVal string
 	fs.StringVar(&outDirVal, "o", "", "output directory")
 	fs.StringVar(&outDirVal, "output", "", "output directory")
+	fs.Usage = func() { printUsage() }
+	if jsonMode {
+		fs.SetOutput(io.Discard)
+	}
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: ttl get [-p PASS] [-o DIR] URL or TOKEN")
+		return fmt.Errorf("Usage: ttl get [-p PASS] [-o DIR] URL or TOKEN")
 	}
 
 	// Validate output directory if specified
 	outputDir, err := resolveOutDir(outDirVal)
-	if err != nil {
-		return err
-	}
-
-	pass, _, err := resolvePassword(passwordVal, passwordStdinVal, passwordFileVal, false)
 	if err != nil {
 		return err
 	}
@@ -65,6 +64,11 @@ func runGet(args []string) error {
 		return err
 	}
 
+	pass, _, err := resolvePassword(passwordVal, passwordStdinVal, passwordFileVal, false)
+	if err != nil {
+		return err
+	}
+
 	// --- probe: fetch header + metadata, verify password ---
 	const probeTimeout = 30 * time.Second
 	probeCtx, probeCancel := context.WithTimeout(context.Background(), probeTimeout)
@@ -72,13 +76,13 @@ func runGet(args []string) error {
 
 	probeURL, err := url.JoinPath(baseURL, "v1", "probe", token)
 	if err != nil {
-		return fmt.Errorf("invalid URL: %w", err)
+		return fmt.Errorf("Invalid URL: %w", err)
 	}
 
 	doProbe := func(client *http.Client) (*http.Response, error) {
 		req, reqErr := http.NewRequestWithContext(probeCtx, "GET", probeURL, nil)
 		if reqErr != nil {
-			return nil, fmt.Errorf("invalid URL: %w", reqErr)
+			return nil, fmt.Errorf("Invalid URL: %w", reqErr)
 		}
 		return client.Do(req)
 	}
@@ -90,7 +94,9 @@ func runGet(args []string) error {
 			if probeResp != nil {
 				probeResp.Body.Close()
 			}
-			fmt.Fprintln(os.Stderr, "\nh3: falling back to tcp")
+			if !jsonMode {
+				fmt.Fprintln(os.Stderr, "\nH3: Falling back to TCP")
+			}
 			probeCancel()
 			probeCtx, probeCancel = context.WithTimeout(context.Background(), probeTimeout)
 			defer probeCancel() // required by go vet
@@ -103,10 +109,10 @@ func runGet(args []string) error {
 		if probeResp != nil {
 			probeResp.Body.Close()
 		}
-		return fmt.Errorf("probe failed: %w", err)
+		return fmt.Errorf("Probe failed: %w", err)
 	}
 
-	// Check status BEFORE closing body (body needed for handleHTTPError)
+	// Check status before closing body — handleHTTPError reads it
 	if probeResp.StatusCode != http.StatusOK {
 		defer probeResp.Body.Close()
 		return handleHTTPError(probeResp)
@@ -116,12 +122,12 @@ func runGet(args []string) error {
 	probeData, err := io.ReadAll(io.LimitReader(probeResp.Body, int64(crypto.ProbeMaxBytes)+1))
 	probeResp.Body.Close()
 	if err != nil {
-		return fmt.Errorf("probe read failed: %w", err)
+		return fmt.Errorf("Probe read failed: %w", err)
 	}
 
 	// Derive key from password + salt in probe header
 	if len(probeData) < crypto.HeaderSize {
-		return fmt.Errorf("not a ttl file: too short")
+		return fmt.Errorf("Not a TTL file: too short")
 	}
 	salt := probeData[crypto.SaltOffset:crypto.NonceOffset]
 	encKey := crypto.DeriveEncKey(pass, salt)
@@ -132,10 +138,13 @@ func runGet(args []string) error {
 	}()
 
 	// Verify the password by decrypting the metadata AEAD tag
-	if err := crypto.VerifyProbe(probeData, encKey); err != nil {
+	probeFilename, probeFileSize, err := crypto.VerifyProbe(probeData, encKey)
+	if err != nil {
 		return err
 	}
-	fmt.Fprintln(os.Stderr, "password verified")
+	if !jsonMode {
+		fmt.Fprintln(os.Stderr, "Password verified")
+	}
 
 	// Derive download token for the authenticated download
 	downloadToken := crypto.DeriveDownloadToken(encKey)
@@ -147,18 +156,21 @@ func runGet(args []string) error {
 	tokenHex := hex.EncodeToString(downloadToken)
 
 	// --- download: full file, authenticated with bearer token ---
-	xferTimeout := resolveTimeout(timeoutVal, crypto.EncryptedSize(crypto.MaxFileBytes, strings.Repeat("x", 255)))
+	xferTimeout, err := resolveTimeout(timeoutVal, crypto.EncryptedSize(probeFileSize, probeFilename))
+	if err != nil {
+		return err
+	}
 	dlCtx, dlCancel := context.WithTimeout(context.Background(), xferTimeout)
 	defer dlCancel()
 
 	downloadURL, err := url.JoinPath(baseURL, token)
 	if err != nil {
-		return fmt.Errorf("invalid URL: %w", err)
+		return fmt.Errorf("Invalid URL: %w", err)
 	}
 	doGet := func(client *http.Client) (*http.Response, error) {
 		req, reqErr := http.NewRequestWithContext(dlCtx, "GET", downloadURL, nil)
 		if reqErr != nil {
-			return nil, fmt.Errorf("invalid URL: %w", reqErr)
+			return nil, fmt.Errorf("Invalid URL: %w", reqErr)
 		}
 		req.Header.Set("X-Download-Token", tokenHex)
 		req.Header.Set("X-Confirm-Burn", "true")
@@ -172,7 +184,9 @@ func runGet(args []string) error {
 			if resp != nil {
 				resp.Body.Close()
 			}
-			fmt.Fprintln(os.Stderr, "\nh3: falling back to tcp")
+			if !jsonMode {
+				fmt.Fprintln(os.Stderr, "\nH3: Falling back to TCP")
+			}
 			dlCancel()
 			dlCtx, dlCancel = context.WithTimeout(context.Background(), xferTimeout)
 			defer dlCancel() // required by go vet
@@ -185,7 +199,7 @@ func runGet(args []string) error {
 		if resp != nil {
 			resp.Body.Close()
 		}
-		return fmt.Errorf("download failed: %w", err)
+		return fmt.Errorf("Download failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -193,13 +207,31 @@ func runGet(args []string) error {
 		return handleHTTPError(resp)
 	}
 
-	filename, written, err := crypto.DecryptStreamWithKey(
-		newProgressReader(resp.Body, 0, 0), encKey, outputDir)
+	encTotal := crypto.EncryptedSize(probeFileSize, probeFilename)
+	origName, filename, written, err := crypto.DecryptStreamWithKey(
+		newProgressReader(resp.Body, encTotal, int64(probeFileSize), jsonMode), encKey, outputDir)
 	if err != nil {
 		return err
 	}
 
-	fmt.Fprintf(os.Stderr, "◉★✧· phew, %s landed safe and sound (%s)\n", filename, humanBytes(written))
+	if jsonMode {
+		savedTo, _ := filepath.Abs(filepath.Join(outputDir, filename))
+		result := map[string]any{
+			"ok":       true,
+			"filename": filename,
+			"size":     written,
+			"saved_to": savedTo,
+		}
+		if filename != origName {
+			result["original_filename"] = origName
+		}
+		json.NewEncoder(os.Stdout).Encode(result)
+	} else {
+		if filename != origName {
+			fmt.Fprintf(os.Stderr, "⚠ %s already exists — saving as %s\n", origName, filename)
+		}
+		fmt.Fprintf(os.Stderr, "◉★✧· Phew, %s landed safe and sound (%s)\n", filename, humanBytes(written))
+	}
 	return nil
 }
 
@@ -226,23 +258,23 @@ func resolveOutDir(dir string) (string, error) {
 	// filesystem path, not a symlink alias.
 	real, err := filepath.EvalSymlinks(dir)
 	if err != nil {
-		return "", fmt.Errorf("output directory does not exist: %s", dir)
+		return "", fmt.Errorf("Output directory does not exist: %s", dir)
 	}
 	abs, err := filepath.Abs(real)
 	if err != nil {
-		return "", fmt.Errorf("invalid output directory: %w", err)
+		return "", fmt.Errorf("Invalid output directory: %w", err)
 	}
 	fi, err := os.Lstat(abs)
 	if err != nil {
-		return "", fmt.Errorf("output directory does not exist: %s", abs)
+		return "", fmt.Errorf("Output directory does not exist: %s", abs)
 	}
 	if !fi.IsDir() {
-		return "", fmt.Errorf("not a directory: %s", abs)
+		return "", fmt.Errorf("Not a directory: %s", abs)
 	}
 	// Check write permission by attempting to create a temp file
 	tmp, err := os.CreateTemp(abs, ".ttl-write-test-*")
 	if err != nil {
-		return "", fmt.Errorf("output directory not writable: %s", abs)
+		return "", fmt.Errorf("Output directory not writable: %s", abs)
 	}
 	tmp.Close()
 	os.Remove(tmp.Name())
@@ -253,29 +285,24 @@ func resolveOutDir(dir string) (string, error) {
 func parseURL(raw string) (token, baseURL string, err error) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return "", "", fmt.Errorf("invalid URL: %s", raw)
+		return "", "", fmt.Errorf("Invalid URL: %s", raw)
 	}
 
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return "", "", fmt.Errorf("invalid URL scheme: %s (http/https only)", u.Scheme)
+		return "", "", fmt.Errorf("Invalid URL scheme: %s (http/https only)", u.Scheme)
 	}
 
 	if u.Host == "" {
-		return "", "", fmt.Errorf("invalid URL: missing host")
+		return "", "", fmt.Errorf("Invalid URL: missing host")
 	}
 
 	if u.User != nil {
-		return "", "", fmt.Errorf("invalid URL: userinfo not allowed")
+		return "", "", fmt.Errorf("Invalid URL: userinfo not allowed")
 	}
 
 	token = strings.TrimPrefix(u.Path, "/")
-	if len(token) != 10 {
-		return "", "", fmt.Errorf("invalid token in URL")
-	}
-	for _, c := range token {
-		if !((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
-			return "", "", fmt.Errorf("invalid token in URL")
-		}
+	if !isToken(token) {
+		return "", "", fmt.Errorf("Invalid token in URL")
 	}
 	baseURL = u.Scheme + "://" + u.Host
 	return token, baseURL, nil
@@ -288,19 +315,13 @@ func handleHTTPError(resp *http.Response) error {
 	json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&p)
 	switch resp.StatusCode {
 	case 404:
-		return fmt.Errorf("link not found")
+		return fmt.Errorf("Link not found")
 	case 429:
-		return fmt.Errorf("rate limit exceeded — max 30 requests per 10s\ntry again later or see: https://ttl.space/usage")
+		return fmt.Errorf("Rate limit exceeded — max 30 requests per 10s\nTry again later or see: https://ttl.space/usage")
 	default:
 		if p.Detail != "" {
-			clean := strings.Map(func(r rune) rune {
-				if r < 0x20 || r == 0x7f {
-					return -1
-				}
-				return r
-			}, p.Detail)
-			return fmt.Errorf("server error: %s", clean)
+			return fmt.Errorf("Server error: %s", stripControl(p.Detail))
 		}
-		return fmt.Errorf("server error: %d", resp.StatusCode)
+		return fmt.Errorf("Server error: %d", resp.StatusCode)
 	}
 }

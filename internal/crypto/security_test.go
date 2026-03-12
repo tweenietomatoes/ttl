@@ -29,7 +29,7 @@ func TestAttack_Decrypt_BitFlipEveryHeaderByte(t *testing.T) {
 		copy(corrupted, encrypted)
 		corrupted[i] ^= 0xff
 
-		_, _, err := DecryptStream(bytes.NewReader(corrupted), "password", ".")
+		_, _, _, err := DecryptStream(bytes.NewReader(corrupted), "password", ".")
 		if err == nil {
 			t.Fatalf("flipping header byte %d should cause error", i)
 		}
@@ -52,7 +52,7 @@ func TestAttack_Decrypt_BitFlipMetaCiphertext(t *testing.T) {
 		copy(corrupted, encrypted)
 		corrupted[i] ^= 0x01 // flip one bit
 
-		_, _, err := DecryptStream(bytes.NewReader(corrupted), "password", ".")
+		_, _, _, err := DecryptStream(bytes.NewReader(corrupted), "password", ".")
 		if err == nil {
 			t.Fatalf("flipping metadata byte %d should cause auth failure", i)
 		}
@@ -77,7 +77,7 @@ func TestAttack_Decrypt_BitFlipDataChunk(t *testing.T) {
 		copy(corrupted, encrypted)
 		corrupted[dataStart+ChunkSize+TagSize-1] ^= 0x01
 
-		_, _, err := DecryptStream(bytes.NewReader(corrupted), "password", ".")
+		_, _, _, err := DecryptStream(bytes.NewReader(corrupted), "password", ".")
 		if err == nil {
 			t.Fatal("flipping data chunk auth tag should cause error")
 		}
@@ -114,7 +114,7 @@ func TestAttack_Decrypt_TruncateAtEveryBoundary(t *testing.T) {
 			continue
 		}
 		truncated := encrypted[:cutoff]
-		_, _, err := DecryptStream(bytes.NewReader(truncated), "password", ".")
+		_, _, _, err := DecryptStream(bytes.NewReader(truncated), "password", ".")
 		if err == nil {
 			t.Fatalf("truncation at byte %d should cause error", cutoff)
 		}
@@ -146,7 +146,7 @@ func TestAttack_Decrypt_ReorderedChunks(t *testing.T) {
 		copy(swapped[dataStart:], chunk2)
 		copy(swapped[dataStart+chunkCipherSize:], chunk1)
 
-		_, _, err := DecryptStream(bytes.NewReader(swapped), "password", ".")
+		_, _, _, err := DecryptStream(bytes.NewReader(swapped), "password", ".")
 		if err == nil {
 			t.Fatal("chunk reordering should cause authentication failure")
 		}
@@ -172,7 +172,7 @@ func TestAttack_Decrypt_DuplicatedChunk(t *testing.T) {
 		copy(duplicated[dataStart+chunkCipherSize:dataStart+chunkCipherSize*2],
 			duplicated[dataStart:dataStart+chunkCipherSize])
 
-		_, _, err := DecryptStream(bytes.NewReader(duplicated), "password", ".")
+		_, _, _, err := DecryptStream(bytes.NewReader(duplicated), "password", ".")
 		if err == nil {
 			t.Fatal("chunk duplication should cause authentication failure")
 		}
@@ -202,7 +202,7 @@ func TestAttack_Decrypt_WrongPasswordVariations(t *testing.T) {
 	}
 
 	for _, pass := range passwords {
-		_, _, err := DecryptStream(bytes.NewReader(encrypted), pass, ".")
+		_, _, _, err := DecryptStream(bytes.NewReader(encrypted), pass, ".")
 		if err == nil {
 			t.Fatalf("password %q should fail decryption", pass)
 		}
@@ -439,7 +439,7 @@ func TestAttack_EncryptDecrypt_ExactlyMaxFilename(t *testing.T) {
 	original := []byte("data for max filename test")
 	encrypted := encryptToBuffer(t, original, maxName, "password")
 
-	filename, written, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
+	_, filename, written, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -463,7 +463,7 @@ func TestAttack_EncryptDecrypt_OverMaxFilename(t *testing.T) {
 	original := []byte("data for over-max filename")
 	encrypted := encryptToBuffer(t, original, overName, "password")
 
-	filename, written, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
+	_, filename, written, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -499,7 +499,7 @@ func TestAttack_EncryptDecrypt_ExactChunkBoundaries(t *testing.T) {
 			}
 			encrypted := encryptToBuffer(t, original, "boundary.bin", "password")
 
-			filename, written, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
+			_, filename, written, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -525,7 +525,7 @@ func TestAttack_EncryptDecrypt_FileOverwriteProtection(t *testing.T) {
 	encrypted := encryptToBuffer(t, original, "exists.txt", "password")
 
 	// First decrypt succeeds
-	fn1, _, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
+	_, fn1, _, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -534,7 +534,7 @@ func TestAttack_EncryptDecrypt_FileOverwriteProtection(t *testing.T) {
 	}
 
 	// Second decrypt should auto-rename, NOT overwrite
-	fn2, _, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
+	_, fn2, _, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
 	if err != nil {
 		t.Fatalf("second decrypt should auto-rename, got error: %v", err)
 	}
@@ -565,7 +565,7 @@ func TestAttack_DecryptCleanupOnFailure(t *testing.T) {
 
 	// Truncate so decryption fails mid-stream
 	truncated := encrypted[:len(encrypted)-100]
-	_, _, err := DecryptStream(bytes.NewReader(truncated), "password", ".")
+	_, _, _, err := DecryptStream(bytes.NewReader(truncated), "password", ".")
 	if err == nil {
 		t.Fatal("truncated file should fail")
 	}
@@ -857,7 +857,7 @@ func TestAttack_CraftedBinary_ValidMinimal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	filename, written, err := DecryptStream(bytes.NewReader(buf.Bytes()), password, ".")
+	_, filename, written, err := DecryptStream(bytes.NewReader(buf.Bytes()), password, ".")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -896,7 +896,7 @@ func TestAttack_CraftedBinary_AppendGarbageAfterValid(t *testing.T) {
 
 	for i, garbage := range garbages {
 		combined := append(append([]byte{}, encrypted...), garbage...)
-		_, _, err := DecryptStream(bytes.NewReader(combined), "password", ".")
+		_, _, _, err := DecryptStream(bytes.NewReader(combined), "password", ".")
 		if err == nil {
 			t.Fatalf("garbage[%d]: should detect trailing data", i)
 		}
@@ -906,7 +906,7 @@ func TestAttack_CraftedBinary_AppendGarbageAfterValid(t *testing.T) {
 // TestAttack_CraftedBinary_EmptyReader tries to decrypt with no data at all.
 func TestAttack_CraftedBinary_EmptyReader(t *testing.T) {
 	_ = withDir(t)
-	_, _, err := DecryptStream(bytes.NewReader(nil), "password", ".")
+	_, _, _, err := DecryptStream(bytes.NewReader(nil), "password", ".")
 	if err == nil {
 		t.Fatal("empty reader should fail")
 	}
@@ -916,7 +916,7 @@ func TestAttack_CraftedBinary_EmptyReader(t *testing.T) {
 func TestAttack_CraftedBinary_AllZeroFile(t *testing.T) {
 	_ = withDir(t)
 	zeros := make([]byte, 1000)
-	_, _, err := DecryptStream(bytes.NewReader(zeros), "password", ".")
+	_, _, _, err := DecryptStream(bytes.NewReader(zeros), "password", ".")
 	if err == nil {
 		t.Fatal("all-zero file should fail (wrong magic)")
 	}
@@ -935,7 +935,7 @@ func TestAttack_CraftedBinary_RandomNoise(t *testing.T) {
 	// Set a plausible metadata length
 	binary.BigEndian.PutUint16(noise[MetaLenOffset:HeaderSize], 56)
 
-	_, _, err := DecryptStream(bytes.NewReader(noise), "password", ".")
+	_, _, _, err := DecryptStream(bytes.NewReader(noise), "password", ".")
 	if err == nil {
 		t.Fatal("random noise should fail decryption (auth tag verification)")
 	}

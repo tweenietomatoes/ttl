@@ -18,14 +18,16 @@ import (
 // DecryptStream decrypts the TTL stream from r and writes the file to outDir.
 // It derives the encryption key from the password internally.
 // outDir must be a valid directory path; use "." for the current directory.
-func DecryptStream(r io.Reader, password string, outDir string) (string, int64, error) {
+// Returns the original filename from metadata, the actual saved filename
+// (which may differ due to auto-rename), the number of bytes written, and any error.
+func DecryptStream(r io.Reader, password string, outDir string) (string, string, int64, error) {
 	// Read the header to extract the salt for key derivation
 	header := make([]byte, HeaderSize)
 	if _, err := io.ReadFull(r, header); err != nil {
-		return "", 0, fmt.Errorf("not a ttl file: too short")
+		return "", "", 0, fmt.Errorf("Not a TTL file: too short")
 	}
 	if !bytes.Equal(header[:MagicSize], []byte(Magic)) {
-		return "", 0, fmt.Errorf("not a ttl file")
+		return "", "", 0, fmt.Errorf("Not a TTL file")
 	}
 
 	salt := header[SaltOffset:NonceOffset]
@@ -36,48 +38,50 @@ func DecryptStream(r io.Reader, password string, outDir string) (string, int64, 
 		}
 	}()
 
-	// Re-assemble the reader: header already consumed, prepend it
+	// Prepend the already-consumed header so DecryptStreamWithKey sees the full stream
 	combined := io.MultiReader(bytes.NewReader(header), r)
 	return DecryptStreamWithKey(combined, key, outDir)
 }
 
 // DecryptStreamWithKey decrypts the TTL stream using a pre-derived key.
 // Used by the two-phase download flow where the key is already known.
-func DecryptStreamWithKey(r io.Reader, key []byte, outDir string) (string, int64, error) {
+// Returns the original filename from metadata, the actual saved filename
+// (which may differ due to auto-rename), the number of bytes written, and any error.
+func DecryptStreamWithKey(r io.Reader, key []byte, outDir string) (string, string, int64, error) {
 	// Read and check the header
 	header := make([]byte, HeaderSize)
 	if _, err := io.ReadFull(r, header); err != nil {
-		return "", 0, fmt.Errorf("not a ttl file: too short")
+		return "", "", 0, fmt.Errorf("Not a TTL file: too short")
 	}
 	if !bytes.Equal(header[:MagicSize], []byte(Magic)) {
-		return "", 0, fmt.Errorf("not a ttl file")
+		return "", "", 0, fmt.Errorf("Not a TTL file")
 	}
 
 	var nonce [NonceSize]byte
 	copy(nonce[:], header[NonceOffset:MetaLenOffset])
 	metaEncLen := int(binary.BigEndian.Uint16(header[MetaLenOffset:HeaderSize]))
 	if metaEncLen < MinMetaEncLen || metaEncLen > MaxMetaEncLen {
-		return "", 0, fmt.Errorf("invalid metadata length: %d", metaEncLen)
+		return "", "", 0, fmt.Errorf("Invalid metadata length: %d", metaEncLen)
 	}
 
 	aead, err := chacha20poly1305.NewX(key)
 	if err != nil {
-		return "", 0, err
+		return "", "", 0, err
 	}
 
 	// Decrypt the metadata (filename, file size, chunk size)
 	metaCipher := make([]byte, metaEncLen)
 	if _, err := io.ReadFull(r, metaCipher); err != nil {
-		return "", 0, fmt.Errorf("incomplete metadata")
+		return "", "", 0, fmt.Errorf("Incomplete metadata")
 	}
 	metaPlain, err := aead.Open(nil, xorNonce(nonce, 0), metaCipher, nil)
 	if err != nil {
-		return "", 0, fmt.Errorf("decryption failed (wrong password?)")
+		return "", "", 0, fmt.Errorf("Decryption failed (wrong password?)")
 	}
 
 	filename, fileSize, chunkSize, err := parseMetadata(metaPlain)
 	if err != nil {
-		return "", 0, fmt.Errorf("invalid metadata: %w", err)
+		return "", "", 0, fmt.Errorf("Invalid metadata: %w", err)
 	}
 
 	// Clean the filename to prevent path traversal
@@ -87,17 +91,17 @@ func DecryptStreamWithKey(r io.Reader, key []byte, outDir string) (string, int64
 	outPath := filepath.Join(outDir, filename)
 	absOut, err := filepath.Abs(outPath)
 	if err != nil {
-		return "", 0, fmt.Errorf("invalid output path: %w", err)
+		return "", "", 0, fmt.Errorf("Invalid output path: %w", err)
 	}
 	absDir, err := filepath.Abs(outDir)
 	if err != nil {
-		return "", 0, fmt.Errorf("invalid output directory: %w", err)
+		return "", "", 0, fmt.Errorf("Invalid output directory: %w", err)
 	}
-	// filepath.Rel avoids false positives that a prefix check would have
-	// (e.g. "/tmp" erroneously matching "/tmpevil").
+	// Use filepath.Rel instead of a prefix check to avoid false positives
+	// like "/tmp" erroneously matching "/tmpevil".
 	rel, relErr := filepath.Rel(absDir, absOut)
 	if relErr != nil || strings.HasPrefix(rel, "..") {
-		return "", 0, fmt.Errorf("path traversal blocked: %s", filename)
+		return "", "", 0, fmt.Errorf("Path traversal blocked: %s", filename)
 	}
 
 	// Verify the first data chunk before creating any file on disk.
@@ -125,22 +129,22 @@ func DecryptStreamWithKey(r io.Reader, key []byte, outDir string) (string, int64
 			cipherLen = int(lastPlainLen) + TagSize
 		}
 		if _, err = io.ReadFull(r, buf[:cipherLen]); err != nil {
-			return "", 0, fmt.Errorf("file truncated at chunk 1")
+			return "", "", 0, fmt.Errorf("File truncated at chunk 1")
 		}
 		firstPlain, err = aead.Open(nil,
 			xorNonce(nonce, 1), buf[:cipherLen], nil)
 		if err != nil {
-			return "", 0, fmt.Errorf("corrupted or tampered data at chunk 1")
+			return "", "", 0, fmt.Errorf("Corrupted or tampered data at chunk 1")
 		}
 	} else {
 		// Zero-byte file: verify EOF before creating any file
 		probe := make([]byte, 1)
 		n, readErr := r.Read(probe)
 		if n > 0 {
-			return "", 0, fmt.Errorf("unexpected trailing data")
+			return "", "", 0, fmt.Errorf("Unexpected trailing data")
 		}
 		if readErr != nil && readErr != io.EOF {
-			return "", 0, fmt.Errorf("error reading stream: %w", readErr)
+			return "", "", 0, fmt.Errorf("Error reading stream: %w", readErr)
 		}
 	}
 
@@ -148,11 +152,11 @@ func DecryptStreamWithKey(r io.Reader, key []byte, outDir string) (string, int64
 	originalFilename := filename
 	outPath, filename, err = findAvailablePath(outDir, filename)
 	if err != nil {
-		return "", 0, err
+		return "", "", 0, err
 	}
 	out, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 	if err != nil {
-		return "", 0, fmt.Errorf("cannot create file: %w", err)
+		return "", "", 0, fmt.Errorf("Cannot create file: %w", err)
 	}
 	var success bool
 	defer func() {
@@ -166,7 +170,7 @@ func DecryptStreamWithKey(r io.Reader, key []byte, outDir string) (string, int64
 	var written int64
 	if len(firstPlain) > 0 {
 		if _, err = out.Write(firstPlain); err != nil {
-			return "", 0, fmt.Errorf("write failed: %w", err)
+			return "", "", 0, fmt.Errorf("Write failed: %w", err)
 		}
 		written += int64(len(firstPlain))
 	}
@@ -182,15 +186,15 @@ func DecryptStreamWithKey(r io.Reader, key []byte, outDir string) (string, int64
 			cipherLen = int(lastPlainLen) + TagSize
 		}
 		if _, err = io.ReadFull(r, buf[:cipherLen]); err != nil {
-			return "", 0, fmt.Errorf("file truncated at chunk %d", chunkIndex)
+			return "", "", 0, fmt.Errorf("File truncated at chunk %d", chunkIndex)
 		}
 		plaintext, err = aead.Open(plaintext[:0],
 			xorNonce(nonce, chunkIndex), buf[:cipherLen], nil)
 		if err != nil {
-			return "", 0, fmt.Errorf("corrupted or tampered data at chunk %d", chunkIndex)
+			return "", "", 0, fmt.Errorf("Corrupted or tampered data at chunk %d", chunkIndex)
 		}
 		if _, err = out.Write(plaintext); err != nil {
-			return "", 0, fmt.Errorf("write failed: %w", err)
+			return "", "", 0, fmt.Errorf("Write failed: %w", err)
 		}
 		written += int64(len(plaintext))
 	}
@@ -199,30 +203,27 @@ func DecryptStreamWithKey(r io.Reader, key []byte, outDir string) (string, int64
 	trail := make([]byte, 1)
 	n, readErr := r.Read(trail)
 	if n > 0 {
-		return "", 0, fmt.Errorf("unexpected trailing data")
+		return "", "", 0, fmt.Errorf("Unexpected trailing data")
 	}
 	if readErr != nil && readErr != io.EOF {
-		return "", 0, fmt.Errorf("error reading stream tail: %w", readErr)
+		return "", "", 0, fmt.Errorf("Error reading stream tail: %w", readErr)
 	}
 
 	// Check that the total bytes written match the expected file size
 	if uint64(written) != fileSize {
-		return "", 0, fmt.Errorf("size mismatch: expected %d, got %d",
+		return "", "", 0, fmt.Errorf("Size mismatch: expected %d, got %d",
 			fileSize, written)
 	}
 
 	// Flush to disk and close before reporting success
 	if err := out.Sync(); err != nil {
-		return "", 0, fmt.Errorf("sync failed: %w", err)
+		return "", "", 0, fmt.Errorf("Sync failed: %w", err)
 	}
 	if err := out.Close(); err != nil {
-		return "", 0, fmt.Errorf("close failed: %w", err)
+		return "", "", 0, fmt.Errorf("Close failed: %w", err)
 	}
 	success = true
-	if filename != originalFilename {
-		fmt.Fprintf(os.Stderr, "⚠ %s already exists, saving as %s\n", originalFilename, filename)
-	}
-	return filename, written, nil
+	return originalFilename, filename, written, nil
 }
 
 // findAvailablePath returns a path that doesn't conflict with existing files.
@@ -235,13 +236,13 @@ func findAvailablePath(dir, filename string) (outPath string, actualName string,
 	fi, statErr := os.Lstat(outPath)
 	if statErr != nil {
 		if !os.IsNotExist(statErr) {
-			return "", "", fmt.Errorf("cannot check path: %w", statErr)
+			return "", "", fmt.Errorf("Cannot check path: %w", statErr)
 		}
 		// Path doesn't exist — use original name
 		return outPath, filename, nil
 	}
 	if fi.IsDir() {
-		return "", "", fmt.Errorf("directory already exists: %s", filename)
+		return "", "", fmt.Errorf("Directory already exists: %s", filename)
 	}
 
 	// File or symlink exists — try sequential suffixes
@@ -252,13 +253,13 @@ func findAvailablePath(dir, filename string) (outPath string, actualName string,
 		suffix := fmt.Sprintf(" (%d)", i)
 		candidate := truncatedCandidate(base, suffix, ext)
 		if candidate == "" {
-			return "", "", fmt.Errorf("filename too long to rename: %s", filename)
+			return "", "", fmt.Errorf("Filename too long to rename: %s", filename)
 		}
 
 		candidatePath := filepath.Join(dir, candidate)
 		if _, lErr := os.Lstat(candidatePath); lErr != nil {
 			if !os.IsNotExist(lErr) {
-				return "", "", fmt.Errorf("cannot check path: %w", lErr)
+				return "", "", fmt.Errorf("Cannot check path: %w", lErr)
 			}
 			return candidatePath, candidate, nil
 		}
@@ -270,13 +271,13 @@ func findAvailablePath(dir, filename string) (outPath string, actualName string,
 	suffix := fmt.Sprintf(" (%x)", rnd)
 	candidate := truncatedCandidate(base, suffix, ext)
 	if candidate == "" {
-		return "", "", fmt.Errorf("filename too long to rename: %s", filename)
+		return "", "", fmt.Errorf("Filename too long to rename: %s", filename)
 	}
 	candidatePath := filepath.Join(dir, candidate)
 	if _, lErr := os.Lstat(candidatePath); lErr == nil {
-		return "", "", fmt.Errorf("cannot find available name for: %s", filename)
+		return "", "", fmt.Errorf("Cannot find available name for: %s", filename)
 	} else if !os.IsNotExist(lErr) {
-		return "", "", fmt.Errorf("cannot check path: %w", lErr)
+		return "", "", fmt.Errorf("Cannot check path: %w", lErr)
 	}
 	return candidatePath, candidate, nil
 }
@@ -309,10 +310,10 @@ func truncatedCandidate(base, suffix, ext string) string {
 // strips trailing dots and spaces, blocks Windows reserved device names,
 // and falls back to "download.bin" if nothing is left.
 func sanitizeFilename(name string) string {
-	// Remove control characters and Unicode format characters (bidi overrides, etc.)
+	// Remove control characters (C0, DEL, C1) and Unicode format characters (bidi overrides, etc.)
 	var clean strings.Builder
 	for _, r := range name {
-		if r >= 0x20 && r != 0x7f && !unicode.Is(unicode.Cf, r) {
+		if r >= 0x20 && !(r >= 0x7f && r <= 0x9f) && !unicode.Is(unicode.Cf, r) {
 			clean.WriteRune(r)
 		}
 	}

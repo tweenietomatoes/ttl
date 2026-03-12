@@ -32,6 +32,6 @@ func FuzzDecrypt_NoPanic(f *testing.F) {
 		orig, _ := os.Getwd()
 		os.Chdir(dir)
 		defer os.Chdir(orig)
-		_, _, _ = DecryptStream(bytes.NewReader(data), "password", ".")
+		_, _, _, _ = DecryptStream(bytes.NewReader(data), "password", ".")
 	})
 }

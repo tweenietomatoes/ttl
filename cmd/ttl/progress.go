@@ -26,7 +26,8 @@ type progressReader struct {
 // newProgressReader wraps r with a progress bar.
 // total is the real byte count used for percentage calculation.
 // displaySize is the file size shown to the user (pass 0 to use total).
-func newProgressReader(r io.Reader, total, displaySize int64) *progressReader {
+// quiet suppresses all output (used by --json mode).
+func newProgressReader(r io.Reader, total, displaySize int64, quiet bool) *progressReader {
 	if displaySize <= 0 {
 		displaySize = total
 	}
@@ -34,7 +35,7 @@ func newProgressReader(r io.Reader, total, displaySize int64) *progressReader {
 		r:       r,
 		total:   total,
 		display: displaySize,
-		tty:     term.IsTerminal(int(os.Stderr.Fd())),
+		tty:     !quiet && term.IsTerminal(int(os.Stderr.Fd())),
 	}
 }
 

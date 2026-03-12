@@ -345,50 +345,92 @@ func TestCLI_Send_DanglingSymlink(t *testing.T) {
 // --- resolveTimeout ---
 
 func TestResolveTimeout_Custom(t *testing.T) {
-	if d := resolveTimeout("5m", 1000); d != 5*time.Minute {
+	d, err := resolveTimeout("5m", 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d != 5*time.Minute {
 		t.Fatalf("expected 5m, got %v", d)
 	}
 }
 
 func TestResolveTimeout_CustomHour(t *testing.T) {
-	if d := resolveTimeout("1h", 1000); d != time.Hour {
+	d, err := resolveTimeout("1h", 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d != time.Hour {
 		t.Fatalf("expected 1h, got %v", d)
 	}
 }
 
 func TestResolveTimeout_Auto_Empty(t *testing.T) {
-	if d := resolveTimeout("", 0); d < 5*time.Minute {
+	d, err := resolveTimeout("", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d < 5*time.Minute {
 		t.Fatalf("auto minimum should be 5m, got %v", d)
 	}
 }
 
 func TestResolveTimeout_Auto_Keyword(t *testing.T) {
-	if d := resolveTimeout("auto", 0); d < 5*time.Minute {
+	d, err := resolveTimeout("auto", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d < 5*time.Minute {
 		t.Fatalf("auto minimum should be 5m, got %v", d)
 	}
 }
 
 func TestResolveTimeout_Auto_LargeFile(t *testing.T) {
 	// 100 MB at 1 Mbps = ~838 s + 120 s buffer = ~16 min.
-	if d := resolveTimeout("", 100*1024*1024); d < 15*time.Minute {
+	d, err := resolveTimeout("", 100*1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d < 15*time.Minute {
 		t.Fatalf("100 MB file should have timeout > 15m, got %v", d)
 	}
 }
 
 func TestResolveTimeout_Invalid(t *testing.T) {
-	if d := resolveTimeout("notaduration", 1000); d < 5*time.Minute {
+	// Non-JSON mode: falls back to auto with warning
+	d, err := resolveTimeout("notaduration", 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d < 5*time.Minute {
 		t.Fatalf("invalid value should fall back to auto (min 5m), got %v", d)
 	}
 }
 
+func TestResolveTimeout_Invalid_JSON(t *testing.T) {
+	jsonMode = true
+	defer func() { jsonMode = false }()
+	_, err := resolveTimeout("notaduration", 1000)
+	if err == nil {
+		t.Fatal("expected error for invalid timeout in JSON mode")
+	}
+}
+
 func TestResolveTimeout_Negative(t *testing.T) {
-	if d := resolveTimeout("-5m", 1000); d < 5*time.Minute {
+	d, err := resolveTimeout("-5m", 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d < 5*time.Minute {
 		t.Fatalf("negative value should fall back to auto, got %v", d)
 	}
 }
 
 func TestResolveTimeout_Zero(t *testing.T) {
-	if d := resolveTimeout("0s", 1000); d < 5*time.Minute {
+	d, err := resolveTimeout("0s", 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d < 5*time.Minute {
 		t.Fatalf("zero value should fall back to auto, got %v", d)
 	}
 }

@@ -32,8 +32,15 @@ func TestVerifyProbe_Success(t *testing.T) {
 	salt := probe[SaltOffset:NonceOffset]
 	key := argon2.IDKey([]byte("password"), salt, ArgonTime, ArgonMemory, ArgonThreads, KeySize)
 
-	if err := VerifyProbe(probe, key); err != nil {
+	filename, fileSize, err := VerifyProbe(probe, key)
+	if err != nil {
 		t.Fatalf("VerifyProbe should succeed: %v", err)
+	}
+	if filename != "test.txt" {
+		t.Fatalf("expected filename 'test.txt', got %q", filename)
+	}
+	if fileSize != uint64(len(data)) {
+		t.Fatalf("expected fileSize %d, got %d", len(data), fileSize)
 	}
 }
 
@@ -44,7 +51,7 @@ func TestVerifyProbe_WrongPassword(t *testing.T) {
 	salt := probe[SaltOffset:NonceOffset]
 	key := argon2.IDKey([]byte("wrongpasswd1"), salt, ArgonTime, ArgonMemory, ArgonThreads, KeySize)
 
-	err := VerifyProbe(probe, key)
+	_, _, err := VerifyProbe(probe, key)
 	if err == nil {
 		t.Fatal("wrong password should fail")
 	}
@@ -60,7 +67,7 @@ func TestVerifyProbe_ZeroByteFile(t *testing.T) {
 	salt := probe[SaltOffset:NonceOffset]
 	key := argon2.IDKey([]byte("password"), salt, ArgonTime, ArgonMemory, ArgonThreads, KeySize)
 
-	if err := VerifyProbe(probe, key); err != nil {
+	if _, _, err := VerifyProbe(probe, key); err != nil {
 		t.Fatalf("zero-byte file probe should succeed: %v", err)
 	}
 }
@@ -75,7 +82,7 @@ func TestVerifyProbe_MultiChunkFile(t *testing.T) {
 	salt := probe[SaltOffset:NonceOffset]
 	key := argon2.IDKey([]byte("password"), salt, ArgonTime, ArgonMemory, ArgonThreads, KeySize)
 
-	if err := VerifyProbe(probe, key); err != nil {
+	if _, _, err := VerifyProbe(probe, key); err != nil {
 		t.Fatalf("multi-chunk probe should succeed: %v", err)
 	}
 }
@@ -89,13 +96,13 @@ func TestVerifyProbe_ExactChunkBoundary(t *testing.T) {
 	salt := probe[SaltOffset:NonceOffset]
 	key := argon2.IDKey([]byte("password"), salt, ArgonTime, ArgonMemory, ArgonThreads, KeySize)
 
-	if err := VerifyProbe(probe, key); err != nil {
+	if _, _, err := VerifyProbe(probe, key); err != nil {
 		t.Fatalf("exact chunk boundary probe should succeed: %v", err)
 	}
 }
 
 func TestVerifyProbe_TooShort(t *testing.T) {
-	err := VerifyProbe([]byte("short"), make([]byte, KeySize))
+	_, _, err := VerifyProbe([]byte("short"), make([]byte, KeySize))
 	if err == nil {
 		t.Fatal("too short should fail")
 	}
@@ -104,7 +111,7 @@ func TestVerifyProbe_TooShort(t *testing.T) {
 func TestVerifyProbe_BadMagic(t *testing.T) {
 	probe := make([]byte, HeaderSize+50)
 	copy(probe, "XXXX") // wrong magic
-	err := VerifyProbe(probe, make([]byte, KeySize))
+	_, _, err := VerifyProbe(probe, make([]byte, KeySize))
 	if err == nil {
 		t.Fatal("bad magic should fail")
 	}
@@ -118,7 +125,7 @@ func TestVerifyProbe_BadMetaEncLen(t *testing.T) {
 	rand.Read(probe[NonceOffset:MetaLenOffset])
 	binary.BigEndian.PutUint16(probe[MetaLenOffset:], 269)
 
-	err := VerifyProbe(probe, make([]byte, KeySize))
+	_, _, err := VerifyProbe(probe, make([]byte, KeySize))
 	if err == nil {
 		t.Fatal("metaEncLen=269 should fail")
 	}
@@ -131,7 +138,7 @@ func TestVerifyProbe_MetaEncLenTooSmall(t *testing.T) {
 	rand.Read(probe[NonceOffset:MetaLenOffset])
 	binary.BigEndian.PutUint16(probe[MetaLenOffset:], 29) // below min
 
-	err := VerifyProbe(probe, make([]byte, KeySize))
+	_, _, err := VerifyProbe(probe, make([]byte, KeySize))
 	if err == nil {
 		t.Fatal("metaEncLen=29 should fail")
 	}
@@ -145,7 +152,7 @@ func TestVerifyProbe_IncompleteMetadata(t *testing.T) {
 	rand.Read(probe[NonceOffset:MetaLenOffset])
 	binary.BigEndian.PutUint16(probe[MetaLenOffset:], 50)
 
-	err := VerifyProbe(probe, make([]byte, KeySize))
+	_, _, err := VerifyProbe(probe, make([]byte, KeySize))
 	if err == nil {
 		t.Fatal("incomplete metadata should fail")
 	}
@@ -162,7 +169,7 @@ func TestVerifyProbe_CorruptedMetadata(t *testing.T) {
 	salt := probe[SaltOffset:NonceOffset]
 	key := argon2.IDKey([]byte("password"), salt, ArgonTime, ArgonMemory, ArgonThreads, KeySize)
 
-	err := VerifyProbe(probe, key)
+	_, _, err := VerifyProbe(probe, key)
 	if err == nil {
 		t.Fatal("corrupted metadata should fail")
 	}
@@ -190,12 +197,12 @@ func TestVerifyProbe_BitFlipEveryHeaderByte(t *testing.T) {
 
 		if bytes.Equal(corruptedSalt, salt) {
 			// Salt unchanged — use original key, nonce is corrupted
-			if err := VerifyProbe(corrupted, key); err == nil {
+			if _, _, err := VerifyProbe(corrupted, key); err == nil {
 				t.Fatalf("flipping header byte %d should cause error", i)
 			}
 		} else {
 			// Salt corrupted — key is different, will fail
-			if err := VerifyProbe(corrupted, corruptedKey); err == nil {
+			if _, _, err := VerifyProbe(corrupted, corruptedKey); err == nil {
 				t.Fatalf("flipping salt byte %d should cause error (different key)", i)
 			}
 		}
@@ -215,7 +222,7 @@ func TestVerifyProbe_ExtraTrailingDataIgnored(t *testing.T) {
 	salt := probe[SaltOffset:NonceOffset]
 	key := argon2.IDKey([]byte("password"), salt, ArgonTime, ArgonMemory, ArgonThreads, KeySize)
 
-	if err := VerifyProbe(probe, key); err != nil {
+	if _, _, err := VerifyProbe(probe, key); err != nil {
 		t.Fatalf("extra trailing data should be ignored: %v", err)
 	}
 }

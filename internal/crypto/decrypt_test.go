@@ -15,7 +15,7 @@ func TestDecrypt_WrongPassword(t *testing.T) {
 
 	encrypted := encryptToBuffer(t, []byte("secret data"), "test.txt", "correctpass1")
 
-	_, _, err := DecryptStream(bytes.NewReader(encrypted), "wrongpass", ".")
+	_, _, _, err := DecryptStream(bytes.NewReader(encrypted), "wrongpass", ".")
 	if err == nil {
 		t.Fatal("expected error for wrong password")
 	}
@@ -27,7 +27,7 @@ func TestDecrypt_Truncated(t *testing.T) {
 	encrypted := encryptToBuffer(t, make([]byte, ChunkSize+100), "test.bin", "password")
 
 	truncated := encrypted[:len(encrypted)-50]
-	_, _, err := DecryptStream(bytes.NewReader(truncated), "password", ".")
+	_, _, _, err := DecryptStream(bytes.NewReader(truncated), "password", ".")
 	if err == nil {
 		t.Fatal("expected error for truncated file")
 	}
@@ -44,7 +44,7 @@ func TestDecrypt_Corrupted(t *testing.T) {
 		corrupted[len(corrupted)-20] ^= 0xff
 	}
 
-	_, _, err := DecryptStream(bytes.NewReader(corrupted), "password", ".")
+	_, _, _, err := DecryptStream(bytes.NewReader(corrupted), "password", ".")
 	if err == nil {
 		t.Fatal("expected error for corrupted data")
 	}
@@ -56,7 +56,7 @@ func TestDecrypt_TrailingData(t *testing.T) {
 	encrypted := encryptToBuffer(t, []byte("datatata"), "test.txt", "password")
 
 	withTrailing := append(encrypted, 0xff, 0xff)
-	_, _, err := DecryptStream(bytes.NewReader(withTrailing), "password", ".")
+	_, _, _, err := DecryptStream(bytes.NewReader(withTrailing), "password", ".")
 	if err == nil {
 		t.Fatal("expected error for trailing data")
 	}
@@ -70,7 +70,7 @@ func TestDecrypt_FileAlreadyExists_AutoRenames(t *testing.T) {
 	// Create the file first so it already exists
 	os.WriteFile(filepath.Join(dir, "existing.txt"), []byte("original"), 0644)
 
-	filename, written, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
+	_, filename, written, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
 	if err != nil {
 		t.Fatalf("expected auto-rename, got error: %v", err)
 	}
@@ -102,12 +102,12 @@ func TestDecrypt_DirAlreadyExistsAsFilename(t *testing.T) {
 	// Create a directory with the same name as the expected filename
 	os.Mkdir(filepath.Join(dir, "subdir"), 0755)
 
-	_, _, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
+	_, _, _, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
 	if err == nil {
 		t.Fatal("expected error when directory exists with same name as file")
 	}
-	if !strings.Contains(err.Error(), "directory already exists") {
-		t.Fatalf("expected 'directory already exists', got: %v", err)
+	if !strings.Contains(err.Error(), "Directory already exists") {
+		t.Fatalf("expected 'Directory already exists', got: %v", err)
 	}
 }
 
@@ -121,7 +121,7 @@ func TestDecrypt_SymlinkAlreadyExists_AutoRenames(t *testing.T) {
 	os.WriteFile(target, []byte("target data"), 0644)
 	os.Symlink(target, filepath.Join(dir, "link.txt"))
 
-	filename, _, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
+	_, filename, _, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
 	if err != nil {
 		t.Fatalf("expected auto-rename, got error: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestDecrypt_OutDir_WritesToCorrectDir(t *testing.T) {
 
 	encrypted := encryptToBuffer(t, []byte("hello output"), "out.txt", "password")
 
-	filename, written, err := DecryptStream(bytes.NewReader(encrypted), "password", outDir)
+	_, filename, written, err := DecryptStream(bytes.NewReader(encrypted), "password", outDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +181,7 @@ func TestDecrypt_AutoRename_MultipleConflicts(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "report.pdf"), []byte("first"), 0644)
 	os.WriteFile(filepath.Join(dir, "report (1).pdf"), []byte("second"), 0644)
 
-	filename, _, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
+	_, filename, _, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
 	if err != nil {
 		t.Fatalf("expected auto-rename, got error: %v", err)
 	}
@@ -211,7 +211,7 @@ func TestDecrypt_AutoRename_NoExtension(t *testing.T) {
 
 	os.WriteFile(filepath.Join(dir, "Makefile"), []byte("original"), 0644)
 
-	filename, _, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
+	_, filename, _, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
 	if err != nil {
 		t.Fatalf("expected auto-rename, got error: %v", err)
 	}
@@ -240,7 +240,7 @@ func TestDecrypt_AutoRename_SymlinkConflictChain(t *testing.T) {
 	os.Symlink(target, filepath.Join(dir, "data.bin"))
 	os.WriteFile(filepath.Join(dir, "data (1).bin"), []byte("copy1"), 0644)
 
-	filename, _, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
+	_, filename, _, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
 	if err != nil {
 		t.Fatalf("expected auto-rename, got error: %v", err)
 	}
@@ -271,7 +271,7 @@ func TestDecrypt_AutoRename_SymlinkAtCandidatePath(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("orig"), 0644)
 	os.Symlink(target, filepath.Join(dir, "notes (1).txt"))
 
-	filename, _, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
+	_, filename, _, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
 	if err != nil {
 		t.Fatalf("expected auto-rename, got error: %v", err)
 	}
@@ -290,7 +290,7 @@ func TestDecrypt_AutoRename_DanglingSymlinkBlocks(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "doc.txt"), []byte("orig"), 0644)
 	os.Symlink("/nonexistent/target", filepath.Join(dir, "doc (1).txt"))
 
-	filename, _, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
+	_, filename, _, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
 	if err != nil {
 		t.Fatalf("expected auto-rename, got error: %v", err)
 	}
@@ -304,7 +304,7 @@ func TestDecrypt_NoConflict_UsesOriginalName(t *testing.T) {
 
 	encrypted := encryptToBuffer(t, []byte("fresh file"), "brand-new.txt", "password")
 
-	filename, written, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
+	_, filename, written, err := DecryptStream(bytes.NewReader(encrypted), "password", ".")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,7 +325,7 @@ func TestDecrypt_MetaEncLenBoundary(t *testing.T) {
 	binary.BigEndian.PutUint16(header[MetaLenOffset:], 269)
 
 	_ = withDir(t)
-	_, _, err := DecryptStream(bytes.NewReader(header), "password", ".")
+	_, _, _, err := DecryptStream(bytes.NewReader(header), "password", ".")
 	if err == nil {
 		t.Fatal("expected error for metaEncLen=269")
 	}

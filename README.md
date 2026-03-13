@@ -6,6 +6,8 @@ CLI for [ttl.space](https://ttl.space) — end-to-end encrypted ephemeral storag
 
 ⏱️ Every file has a time-to-live. When it expires, the server deletes it permanently.
 
+🤖 **AI-agent ready** — `--json` mode provides structured input/output with auto-generated passwords, deterministic exit codes, and machine-parseable errors. No interactive prompts, no terminal required.
+
 ## 📦 Install
 
 🍺 **macOS** (Homebrew)
@@ -47,9 +49,9 @@ $ ttl send secret.pdf
 No password provided. Generate one? [Y/n]: y
 Generated password: aB3kL9mX
 4.2 MB / 4.2 MB  ·✧★◉✧··✧·✧★◉✧··✧·✧★◉✧··✧·✧★  100%  1.5 MB/s
-·✧★◉ thank goodness, secret.pdf is in orbit (4.2 MB)
-IMPORTANT! save your password — required to download and decrypt the file.
-password: aB3kL9mX
+·✧★◉ Thank goodness, secret.pdf is in orbit (4.2 MB)
+IMPORTANT! Save your password — required to download and decrypt the file.
+Password: aB3kL9mX
 https://ttl.space/aBcDeFgHiJ
 ```
 
@@ -58,9 +60,9 @@ Download using the full URL:
 ```
 $ ttl get https://ttl.space/aBcDeFgHiJ
 Enter password: ········
-password verified
-4.2 MB / ∞  ·✧★◉✧··✧·  1.5 MB/s
-◉★✧· phew, secret.pdf landed safe and sound (4.2 MB)
+Password verified
+4.2 MB / 4.2 MB  ·✧★◉✧··✧·✧★◉✧··✧·✧★◉✧··✧·✧★  100%  1.5 MB/s
+◉★✧· Phew, secret.pdf landed safe and sound (4.2 MB)
 ```
 
 Or just the 10-character token — same result:
@@ -75,17 +77,17 @@ Files can self-destruct after the first download. Once retrieved, the server del
 
 ```
 $ ttl send -b confidential.pdf
-·✧★◉ thank goodness, confidential.pdf is in orbit (912.0 KB, self-destructs after download)
+·✧★◉ Thank goodness, confidential.pdf is in orbit (912.0 KB, self-destructs after download)
 ```
 
 ```
 $ ttl get aBcDeFgHiJ
 Enter password: ········
-password verified
-◉★✧· phew, confidential.pdf landed safe and sound (912.0 KB)
+Password verified
+◉★✧· Phew, confidential.pdf landed safe and sound (912.0 KB)
 
 $ ttl get aBcDeFgHiJ
-error: link not found
+Error: Link not found
 ```
 
 A second attempt returns an error — the file no longer exists.
@@ -93,8 +95,8 @@ A second attempt returns an error — the file no longer exists.
 ## Usage
 
 ```
-ttl send [-p P] [-t DUR] [-b] [--timeout D] FILE
-ttl get  [-p P] [--timeout D] [-o DIR] URL or TOKEN
+ttl send [-p P] [-t DUR] [-b] [--json] [--timeout D] FILE
+ttl get  [-p P] [--json] [--timeout D] [-o DIR] URL or TOKEN
 ttl version
 ```
 
@@ -104,10 +106,11 @@ ttl version
 | `-t, --ttl DUR` | Time to live: `5m` `10m` `15m` `30m` `1h` `2h` `3h` `6h` `12h` `24h` `1d` `2d` `3d` `4d` `5d` `6d` `7d` (default: `7d`) |
 | `-b, --burn` | Burn after reading — deleted after first download |
 | `-o, --output DIR` | Output directory (default: current directory) |
-| `--timeout D` | Transfer timeout (e.g. `5m`, `1h`). Default: auto |
+| `--timeout D` | Transfer timeout (e.g. `5m`, `1h`). Default: auto (assumes 1 Mbps) |
 | `--server URL` | Server endpoint (default: `https://ttl.space`) |
 | `--password-stdin` | Read password from stdin |
 | `--password-file F` | Read password from file |
+| `--json` | Output JSON to stdout (for scripts and AI agents) |
 | `-h3, --http3` | Try HTTP/3 (QUIC) first, fall back to TCP |
 
 ## 💡 Examples
@@ -151,6 +154,28 @@ Password from a file (useful for CI/CD and Docker secrets):
 ttl send --password-file /run/secrets/pw backup.tar.gz
 ```
 
+## 🤖 JSON mode (scripts & AI agents)
+
+`--json` makes ttl fully non-interactive — no prompts, no progress bars, just structured JSON on stdout. Designed for AI agents, CI/CD pipelines, and tool-use integrations.
+
+```
+$ ttl --json send report.pdf
+{"ok":true,"link":"https://ttl.space/xK9mQ2vLpA","filename":"report.pdf","size":2097152,"ttl":"7d","burn":false,"password":"aB3kL9mX"}
+
+$ ttl --json get -p aB3kL9mX xK9mQ2vLpA
+{"ok":true,"filename":"report.pdf","size":2097152,"saved_to":"/home/user/report.pdf"}
+
+$ ttl --json get -p aB3kL9mX nonExistent
+{"ok":false,"error":"Link not found"}
+```
+
+| Behavior | Detail |
+|----------|--------|
+| Password | Auto-generated and included in response if not provided during send |
+| Output | Single JSON object on stdout, nothing on stderr |
+| Exit code | `0` on success, `1` on error |
+| Errors | `{"ok":false,"error":"..."}` — always parseable |
+
 ## 🔑 Password handling
 
 | Method | Usage |
@@ -161,7 +186,7 @@ ttl send --password-file /run/secrets/pw backup.tar.gz
 | Stdin | `echo "t0pSecret" \| ttl send --password-stdin file.txt` |
 | File | `ttl send --password-file /run/secrets/pw file.txt` |
 
-Minimum password length is 8 characters. For scripts, prefer `--password-stdin` or `--password-file` over `-p`.
+Minimum password length is 8 characters. Only one password source can be used at a time — combining `-p`, `--password-stdin`, and `--password-file` is an error. For scripts, prefer `--password-stdin` or `--password-file` over `-p`.
 
 ## 🛡️ How it works
 
@@ -215,6 +240,7 @@ This ensures only properly encrypted files are stored, even if a client is buggy
 | Uploads per IP | 10 per day, min 3 seconds apart |
 | Requests per IP | 30 per 10 seconds |
 | Min password | 8 characters |
+| Connections per IP | 10 concurrent |
 
 ## 📖 Documentation
 

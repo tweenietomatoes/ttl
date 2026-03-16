@@ -260,6 +260,8 @@ func TestJSON_Get_Success(t *testing.T) {
 	var srvURL string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.URL.Path == "/v1/limits":
+			writeMockLimits(w)
 		case r.Method == "PUT" && r.URL.Path == "/v1/files":
 			data, _ := io.ReadAll(r.Body)
 			store["blob"] = data
@@ -352,6 +354,8 @@ func TestJSON_Get_SilentStderr(t *testing.T) {
 	var srvURL string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.URL.Path == "/v1/limits":
+			writeMockLimits(w)
 		case r.Method == "PUT":
 			data, _ := io.ReadAll(r.Body)
 			store["blob"] = data
@@ -414,6 +418,8 @@ func TestJSON_Get_WrongPassword(t *testing.T) {
 	var srvURL string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.URL.Path == "/v1/limits":
+			writeMockLimits(w)
 		case r.Method == "PUT":
 			data, _ := io.ReadAll(r.Body)
 			store["blob"] = data
@@ -508,6 +514,8 @@ func TestJSON_E2E_FullAutomationRoundTrip(t *testing.T) {
 	var srvURL string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.URL.Path == "/v1/limits":
+			writeMockLimits(w)
 		case r.Method == "PUT" && r.URL.Path == "/v1/files":
 			data, _ := io.ReadAll(r.Body)
 			store["blob"] = data

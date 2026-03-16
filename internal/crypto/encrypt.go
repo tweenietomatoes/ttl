@@ -8,7 +8,6 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
-// EncryptStream writes the encrypted TTL stream to w, reading plaintext from file.
 func EncryptStream(w io.Writer, file io.Reader, filename string,
 	fileSize uint64, key, salt []byte) error {
 
@@ -18,7 +17,7 @@ func EncryptStream(w io.Writer, file io.Reader, filename string,
 	}
 
 	var nonce [NonceSize]byte
-	rand.Read(nonce[:])
+	io.ReadFull(rand.Reader, nonce[:])
 
 	metaPlain := buildMetadata(filename, fileSize)
 	metaCipher := aead.Seal(nil, xorNonce(nonce, 0), metaPlain, nil)

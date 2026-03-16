@@ -9,8 +9,6 @@ import (
 	"github.com/quic-go/quic-go/http3"
 )
 
-// newH3Client returns an HTTP/3 (QUIC) client.
-// The transfer deadline is controlled by the request context.
 func newH3Client() *http.Client {
 	return &http.Client{
 		Transport: &http3.Transport{
@@ -24,9 +22,7 @@ func newH3Client() *http.Client {
 	}
 }
 
-// newTCPClient returns a TCP client (HTTP/1.1 + HTTP/2).
-// Clones http.DefaultTransport to keep its dial, TLS, and proxy settings.
-// Response header timeout is left at zero because the server replies only
+// Response header timeout is zero because the server replies only
 // after the full upload completes.
 func newTCPClient(transferTimeout time.Duration) *http.Client {
 	base := http.DefaultTransport.(*http.Transport).Clone()

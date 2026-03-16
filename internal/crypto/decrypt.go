@@ -267,7 +267,7 @@ func findAvailablePath(dir, filename string) (outPath string, actualName string,
 
 	// All (1)–(99) taken: use a random 2-byte hex suffix
 	var rnd [2]byte
-	rand.Read(rnd[:])
+	io.ReadFull(rand.Reader, rnd[:])
 	suffix := fmt.Sprintf(" (%x)", rnd)
 	candidate := truncatedCandidate(base, suffix, ext)
 	if candidate == "" {

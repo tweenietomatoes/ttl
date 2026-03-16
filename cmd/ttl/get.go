@@ -99,7 +99,7 @@ func runGet(args []string) error {
 			}
 			probeCancel()
 			probeCtx, probeCancel = context.WithTimeout(context.Background(), probeTimeout)
-			defer probeCancel() // required by go vet
+			defer probeCancel()
 			probeResp, err = doProbe(newTCPClient(probeTimeout))
 		}
 	} else {
@@ -189,7 +189,7 @@ func runGet(args []string) error {
 			}
 			dlCancel()
 			dlCtx, dlCancel = context.WithTimeout(context.Background(), xferTimeout)
-			defer dlCancel() // required by go vet
+			defer dlCancel()
 			resp, err = doGet(newTCPClient(xferTimeout))
 		}
 	} else {
@@ -235,7 +235,6 @@ func runGet(args []string) error {
 	return nil
 }
 
-// isToken returns true if s is exactly 10 alphanumeric characters (a bare token).
 func isToken(s string) bool {
 	if len(s) != 10 {
 		return false
@@ -248,8 +247,6 @@ func isToken(s string) bool {
 	return true
 }
 
-// resolveOutDir validates and resolves the output directory.
-// Returns "." if dir is empty.
 func resolveOutDir(dir string) (string, error) {
 	if dir == "" {
 		return ".", nil
@@ -281,7 +278,6 @@ func resolveOutDir(dir string) (string, error) {
 	return abs, nil
 }
 
-// parseURL splits a URL into its token and base, and checks that the scheme and format are valid.
 func parseURL(raw string) (token, baseURL string, err error) {
 	u, err := url.Parse(raw)
 	if err != nil {

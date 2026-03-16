@@ -77,12 +77,15 @@ func TestMetadata_RoundTrip(t *testing.T) {
 	}
 }
 
-func TestParseMetadata_RejectsOversizeFile(t *testing.T) {
-	tooBig := uint64(MaxFileBytes + 1)
-	meta := buildMetadata("x.bin", tooBig)
-	_, _, _, err := parseMetadata(meta)
-	if err == nil {
-		t.Fatal("expected error for oversize file metadata")
+func TestParseMetadata_AcceptsLargeFile(t *testing.T) {
+	large := uint64(10_737_418_240) // 10 GB (Orbit max)
+	meta := buildMetadata("x.bin", large)
+	_, size, _, err := parseMetadata(meta)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if size != large {
+		t.Fatalf("expected %d, got %d", large, size)
 	}
 }
 

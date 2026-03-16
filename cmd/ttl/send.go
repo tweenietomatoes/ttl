@@ -30,7 +30,8 @@ var labelToSeconds = map[string]int{
 	"1h": 3600, "2h": 7200, "3h": 10800, "6h": 21600,
 	"12h": 43200, "24h": 86400, "1d": 86400, "2d": 172800,
 	"3d": 259200, "4d": 345600, "5d": 432000, "6d": 518400,
-	"7d": 604800,
+	"7d":  604800,
+	"14d": 1209600, "15d": 1296000, "28d": 2419200, "30d": 2592000,
 }
 
 func runSend(args []string) error {
@@ -90,8 +91,22 @@ func runSend(args []string) error {
 	if info.Size() == 0 {
 		return fmt.Errorf("File is empty")
 	}
-	if info.Size() > crypto.MaxFileBytes {
-		return fmt.Errorf("File too large (%s, max 256 MB)\nSee limits: https://ttl.space/usage", humanBytes(info.Size()))
+	// Load API key (empty = free tier)
+	apiKey := loadAPIKey()
+
+	// Fetch server-side limits (respects plan tier)
+	serverLimits, limitsErr := fetchLimits(serverVal, apiKey)
+	if limitsErr != nil {
+		return fmt.Errorf("Cannot reach server: %w", limitsErr)
+	}
+	maxFileBytes := int64(crypto.MaxFileBytes)
+	if mfb := jsonInt64(serverLimits["max_file_bytes"]); mfb > 0 {
+		maxFileBytes = mfb
+	}
+
+	if info.Size() > maxFileBytes {
+		return fmt.Errorf("File too large (%s, max %s)\nSee limits: https://ttl.space/usage",
+			humanBytes(info.Size()), humanBytes(maxFileBytes))
 	}
 
 	// In JSON mode without explicit password, auto-generate one
@@ -113,6 +128,24 @@ func runSend(args []string) error {
 	ttlSeconds, err := parseTTL(ttlVal)
 	if err != nil {
 		return err
+	}
+
+	// Pre-validate TTL against server's allowed values
+	if allowed, ok := serverLimits["allowed_ttl_seconds"].([]any); ok {
+		found := false
+		for _, v := range allowed {
+			if int(jsonInt64(v)) == ttlSeconds {
+				found = true
+				break
+			}
+		}
+		if !found {
+			plan, _ := serverLimits["plan"].(string)
+			if plan == "free" {
+				return fmt.Errorf("TTL %s is not available on the free plan (max 7d)\nUpgrade to Orbit for up to 30 days: https://ttl.space", ttlVal)
+			}
+			return fmt.Errorf("Invalid TTL %s for your plan", ttlVal)
+		}
 	}
 
 	salt := randomBytes(crypto.SaltSize)
@@ -161,6 +194,7 @@ func runSend(args []string) error {
 		req.Header.Set("Content-Type", "application/octet-stream")
 		req.Header.Set("X-TTL", strconv.Itoa(ttlSeconds))
 		req.Header.Set("X-Token-Hash", tokenHash)
+		setAPIKeyHeader(req.Header, apiKey)
 		if burnVal {
 			req.Header.Set("X-Burn-After-Reading", "true")
 		}
@@ -184,7 +218,7 @@ func runSend(args []string) error {
 			<-errCh
 
 			ctx, cancel = context.WithTimeout(context.Background(), xferTimeout)
-			defer cancel() // go vet requires every cancel to be deferred
+			defer cancel()
 			pr, pw = io.Pipe()
 			errCh = make(chan error, 1)
 			if _, seekErr := f.Seek(0, io.SeekStart); seekErr != nil {
@@ -325,6 +359,16 @@ func resolvePassword(flagValue string, fromStdin bool, fromFile string,
 		return pass, false, nil
 	}
 
+	// Check for ttl.password file (binary-adjacent, then ~/.ttl/password)
+	for _, p := range passwordFilePaths() {
+		if raw, err := os.ReadFile(p); err == nil {
+			pass := strings.TrimSpace(string(raw))
+			if pass != "" && utf8.RuneCountInString(pass) >= minPasswordLength {
+				return pass, false, nil
+			}
+		}
+	}
+
 	// No terminal and no password given — cannot prompt
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
 		return "", false, fmt.Errorf("No password provided; use --password-stdin or --password-file")
@@ -399,7 +443,7 @@ func generatePassword(length int) (string, error) {
 func parseTTL(label string) (int, error) {
 	seconds, ok := labelToSeconds[label]
 	if !ok {
-		return 0, fmt.Errorf("Invalid duration: %s (use 5m,10m,15m,30m,1h,2h,3h,6h,12h,24h,1d,2d,3d,4d,5d,6d,7d)", label)
+		return 0, fmt.Errorf("Invalid duration: %s (use 5m,10m,15m,30m,1h,2h,3h,6h,12h,24h,1d,2d,3d,4d,5d,6d,7d,14d,15d,28d,30d)", label)
 	}
 	return seconds, nil
 }
@@ -417,13 +461,23 @@ func humanBytes(b int64) string {
 	}
 }
 
+func passwordFilePaths() []string {
+	var paths []string
+	if exe, err := os.Executable(); err == nil {
+		paths = append(paths, filepath.Join(filepath.Dir(exe), "ttl.password"))
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths, filepath.Join(home, ".ttl", "password"))
+	}
+	return paths
+}
+
 func randomBytes(n int) []byte {
 	b := make([]byte, n)
-	rand.Read(b)
+	io.ReadFull(rand.Reader, b)
 	return b
 }
 
-// stripControl removes invisible control characters (C0, DEL, C1) from s.
 func stripControl(s string) string {
 	return strings.Map(func(r rune) rune {
 		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
@@ -433,7 +487,6 @@ func stripControl(s string) string {
 	}, s)
 }
 
-// handleUploadError turns HTTP error responses into user-friendly messages.
 func handleUploadError(resp *http.Response) error {
 	var p struct {
 		Detail string `json:"detail"`
@@ -443,9 +496,15 @@ func handleUploadError(resp *http.Response) error {
 	case 404:
 		return fmt.Errorf("Upload endpoint not found (server may be misconfigured)")
 	case 413:
-		return fmt.Errorf("File too large — max 256 MB per file\nSee limits: https://ttl.space/usage")
+		if p.Detail != "" {
+			return fmt.Errorf("%s\nSee limits: https://ttl.space/usage", stripControl(p.Detail))
+		}
+		return fmt.Errorf("File too large\nSee limits: https://ttl.space/usage")
 	case 429:
-		return fmt.Errorf("Rate limit exceeded — max 10 uploads/day, min 3s between uploads, 30 req/10s\nTry again later or see: https://ttl.space/usage")
+		if p.Detail != "" {
+			return fmt.Errorf("%s\nTry again later or see: https://ttl.space/usage", stripControl(p.Detail))
+		}
+		return fmt.Errorf("Rate limit exceeded\nTry again later or see: https://ttl.space/usage")
 	default:
 		if p.Detail != "" {
 			return fmt.Errorf("Upload failed: %s", stripControl(p.Detail))
@@ -454,9 +513,7 @@ func handleUploadError(resp *http.Response) error {
 	}
 }
 
-// resolveTimeout returns the transfer timeout.
-// Uses the user's value if given (e.g. "5m", "1h"), otherwise estimates
-// based on 1 Mbps speed plus a 2-minute buffer (minimum 5 minutes).
+// Estimates based on 1 Mbps speed plus a 2-minute buffer (minimum 5 minutes).
 func resolveTimeout(flag string, transferBytes int64) (time.Duration, error) {
 	if flag != "" && flag != "auto" {
 		d, err := time.ParseDuration(flag)

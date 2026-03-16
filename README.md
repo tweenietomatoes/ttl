@@ -92,26 +92,69 @@ Error: Link not found
 
 A second attempt returns an error — the file no longer exists.
 
-## Usage
+## 🪐 Orbit plan
+
+[Orbit](https://ttl.space/orbit) unlocks larger files, longer retention, and more uploads.
+
+The Orbit key is auto-detected (first match wins):
+
+1. `TTL_API_KEY` environment variable
+2. `ttl.key` next to the binary
+3. `~/.ttl/key`
+
+```
+$ ttl activate ttl_orbit_aBcDeFgHiJ...
+Orbit plan activated. Key saved to /usr/local/bin/ttl.key
+
+$ ttl plan
+Plan: orbit
+Max file size: 10.0 GB
+Max TTL: 30 days
+Uploads per day: 50
+
+$ ttl send -t 30d large-backup.tar.gz
+
+$ ttl list
+  xK9mQ2vLpA    4.2 MB  2026-03-16 10:30 → 2026-04-15 10:30  [active]
+  https://ttl.space/xK9mQ2vLpA
+
+$ ttl delete xK9mQ2vLpA
+Deleted: xK9mQ2vLpA
+
+$ ttl deactivate
+Key file removed: /usr/local/bin/ttl.key
+```
+
+## 📋 Usage
 
 ```
 ttl send [-p P] [-t DUR] [-b] [--json] [--timeout D] FILE
 ttl get  [-p P] [--json] [--timeout D] [-o DIR] URL or TOKEN
+ttl activate <key>
+ttl deactivate
+ttl plan
+ttl list
+ttl delete <token>
 ttl version
 ```
 
 | Flag | Description |
 |------|-------------|
 | `-p, --password P` | Encryption / decryption password |
-| `-t, --ttl DUR` | Time to live: `5m` `10m` `15m` `30m` `1h` `2h` `3h` `6h` `12h` `24h` `1d` `2d` `3d` `4d` `5d` `6d` `7d` (default: `7d`) |
+| `-t, --ttl DUR` | Time to live (default: `7d`). See [valid values](#ttl-values) below. |
 | `-b, --burn` | Burn after reading — deleted after first download |
 | `-o, --output DIR` | Output directory (default: current directory) |
 | `--timeout D` | Transfer timeout (e.g. `5m`, `1h`). Default: auto (assumes 1 Mbps) |
-| `--server URL` | Server endpoint (default: `https://ttl.space`) |
 | `--password-stdin` | Read password from stdin |
 | `--password-file F` | Read password from file |
 | `--json` | Output JSON to stdout (for scripts and AI agents) |
 | `-h3, --http3` | Try HTTP/3 (QUIC) first, fall back to TCP |
+
+### TTL values
+
+Free tier: `5m` `10m` `15m` `30m` `1h` `2h` `3h` `6h` `12h` `24h` `1d` `2d` `3d` `4d` `5d` `6d` `7d`
+
+Orbit adds: `14d` `15d` `28d` `30d`
 
 ## 💡 Examples
 
@@ -154,6 +197,21 @@ Password from a file (useful for CI/CD and Docker secrets):
 ttl send --password-file /run/secrets/pw backup.tar.gz
 ```
 
+## 🔑 Password handling
+
+Password is resolved in this order (first match wins):
+
+| Priority | Method | Usage |
+|----------|--------|-------|
+| 1 | `-p` flag | `ttl send -p t0pSecret file.txt` — visible in `ps` and shell history |
+| 2 | `--password-stdin` | `echo "t0pSecret" \| ttl send --password-stdin file.txt` |
+| 3 | `--password-file` | `ttl send --password-file /run/secrets/pw file.txt` |
+| 4 | `ttl.password` file | Auto-detected from next to binary or `~/.ttl/password` |
+| 5 | Interactive prompt | Prompted securely with hidden input (terminal only) |
+| 6 | Auto-generate | If none of the above, generates an 8-character random password (send only) |
+
+Minimum password length is 8 characters. Only one explicit source (`-p`, `--password-stdin`, `--password-file`) can be used at a time. For scripts, prefer `--password-stdin` or `--password-file` over `-p`.
+
 ## 🤖 JSON mode (scripts & AI agents)
 
 `--json` makes ttl fully non-interactive — no prompts, no progress bars, just structured JSON on stdout. Designed for AI agents, CI/CD pipelines, and tool-use integrations.
@@ -175,18 +233,6 @@ $ ttl --json get -p aB3kL9mX nonExistent
 | Output | Single JSON object on stdout, nothing on stderr |
 | Exit code | `0` on success, `1` on error |
 | Errors | `{"ok":false,"error":"..."}` — always parseable |
-
-## 🔑 Password handling
-
-| Method | Usage |
-|--------|-------|
-| Auto-generate | `ttl send file.txt` — generates an 8-character random password |
-| Interactive | Prompted securely with hidden input |
-| Flag | `ttl send -p t0pSecret file.txt` — visible in `ps` and shell history |
-| Stdin | `echo "t0pSecret" \| ttl send --password-stdin file.txt` |
-| File | `ttl send --password-file /run/secrets/pw file.txt` |
-
-Minimum password length is 8 characters. Only one password source can be used at a time — combining `-p`, `--password-stdin`, and `--password-file` is an error. For scripts, prefer `--password-stdin` or `--password-file` over `-p`.
 
 ## 🛡️ How it works
 
@@ -231,16 +277,19 @@ The server validates every upload before storing it:
 
 This ensures only properly encrypted files are stored, even if a client is buggy.
 
-## Limits
+## 📊 Limits
 
-| Limit | Value |
-|-------|-------|
-| Max file size | 256 MB |
-| Max retention | 7 days |
-| Uploads per IP | 10 per day, min 3 seconds apart |
-| Requests per IP | 30 per 10 seconds |
-| Min password | 8 characters |
-| Connections per IP | 10 concurrent |
+Limits are fetched from the server at upload time and depend on your plan.
+
+| Limit | Free | Orbit |
+|-------|------|-------|
+| Max file size | 2 GB | 10 GB |
+| Max retention | 7 days | 30 days |
+| Uploads per day | 10 | 50 |
+| Storage quota | — | 100 GB |
+| Delete & list | — | ✓ |
+| Min password | 8 characters | 8 characters |
+| Requests per IP | 30 per 10 seconds | 30 per 10 seconds |
 
 ## 📖 Documentation
 

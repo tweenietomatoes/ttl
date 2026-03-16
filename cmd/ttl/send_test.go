@@ -41,6 +41,10 @@ func TestHumanBytes(t *testing.T) {
 
 func TestRunSend_RejectsMalformed201_MissingLink(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/limits" {
+			writeMockLimits(w)
+			return
+		}
 		io.Copy(io.Discard, r.Body)
 		w.WriteHeader(http.StatusCreated)
 		w.Write([]byte(`{"token":"abc"}`))
@@ -60,6 +64,10 @@ func TestRunSend_RejectsMalformed201_MissingLink(t *testing.T) {
 
 func TestRunSend_RejectsMalformed201_BadJSON(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/limits" {
+			writeMockLimits(w)
+			return
+		}
 		io.Copy(io.Discard, r.Body)
 		w.WriteHeader(http.StatusCreated)
 		w.Write([]byte(`not json`))
@@ -171,6 +179,10 @@ func TestCLI_Send_ConflictPasswordStdinAndFlag(t *testing.T) {
 func TestCLI_Send_Burn_ShortFlag(t *testing.T) {
 	var gotBurn string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/limits" {
+			writeMockLimits(w)
+			return
+		}
 		gotBurn = r.Header.Get("X-Burn-After-Reading")
 		io.Copy(io.Discard, r.Body)
 		w.WriteHeader(201)
@@ -190,6 +202,10 @@ func TestCLI_Send_Burn_ShortFlag(t *testing.T) {
 func TestCLI_Send_Burn_LongFlag(t *testing.T) {
 	var gotBurn string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/limits" {
+			writeMockLimits(w)
+			return
+		}
 		gotBurn = r.Header.Get("X-Burn-After-Reading")
 		io.Copy(io.Discard, r.Body)
 		w.WriteHeader(201)
@@ -209,6 +225,10 @@ func TestCLI_Send_Burn_LongFlag(t *testing.T) {
 func TestCLI_Send_NoBurn_HeaderAbsent(t *testing.T) {
 	var gotBurn string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/limits" {
+			writeMockLimits(w)
+			return
+		}
 		gotBurn = r.Header.Get("X-Burn-After-Reading")
 		io.Copy(io.Discard, r.Body)
 		w.WriteHeader(201)
@@ -230,6 +250,10 @@ func TestCLI_Send_NoBurn_HeaderAbsent(t *testing.T) {
 func TestCLI_Send_TTL_HeaderSent(t *testing.T) {
 	var gotTTL string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/limits" {
+			writeMockLimits(w)
+			return
+		}
 		gotTTL = r.Header.Get("X-TTL")
 		io.Copy(io.Discard, r.Body)
 		w.WriteHeader(201)
@@ -249,6 +273,10 @@ func TestCLI_Send_TTL_HeaderSent(t *testing.T) {
 func TestCLI_Send_TTL_DefaultIs7d(t *testing.T) {
 	var gotTTL string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/limits" {
+			writeMockLimits(w)
+			return
+		}
 		gotTTL = r.Header.Get("X-TTL")
 		io.Copy(io.Discard, r.Body)
 		w.WriteHeader(201)
@@ -269,6 +297,10 @@ func TestCLI_Send_ContentTypeAndLength(t *testing.T) {
 	var gotCT string
 	var gotCL int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/limits" {
+			writeMockLimits(w)
+			return
+		}
 		gotCT = r.Header.Get("Content-Type")
 		gotCL = r.ContentLength
 		io.Copy(io.Discard, r.Body)
@@ -294,6 +326,10 @@ func TestCLI_Send_ContentTypeAndLength(t *testing.T) {
 func TestCLI_Send_ServerFlag(t *testing.T) {
 	var gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/limits" {
+			writeMockLimits(w)
+			return
+		}
 		gotPath = r.URL.Path
 		io.Copy(io.Discard, r.Body)
 		w.WriteHeader(201)
@@ -491,7 +527,17 @@ func TestCLI_E2E_SendGetRoundTrip(t *testing.T) {
 	store := make(map[string][]byte)
 	var srvURL string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/limits" {
+			writeMockLimits(w)
+			return
+		}
 		switch {
+		case r.Method == "GET" && r.URL.Path == "/v1/limits":
+			json.NewEncoder(w).Encode(map[string]any{
+				"plan": "free", "max_file_bytes": 2147483648, "max_ttl_seconds": 604800,
+				"default_ttl_seconds": 604800, "uploads_per_day": 10,
+				"allowed_ttl_seconds": []int{300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 259200, 345600, 432000, 518400, 604800},
+			})
 		case r.Method == "PUT" && r.URL.Path == "/v1/files":
 			data, _ := io.ReadAll(r.Body)
 			store["blob"] = data
@@ -548,7 +594,17 @@ func TestCLI_E2E_WrongPassword(t *testing.T) {
 	store := make(map[string][]byte)
 	var srvURL string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/limits" {
+			writeMockLimits(w)
+			return
+		}
 		switch {
+		case r.Method == "GET" && r.URL.Path == "/v1/limits":
+			json.NewEncoder(w).Encode(map[string]any{
+				"plan": "free", "max_file_bytes": 2147483648, "max_ttl_seconds": 604800,
+				"default_ttl_seconds": 604800, "uploads_per_day": 10,
+				"allowed_ttl_seconds": []int{300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 259200, 345600, 432000, 518400, 604800},
+			})
 		case r.Method == "PUT":
 			data, _ := io.ReadAll(r.Body)
 			store["blob"] = data
@@ -586,7 +642,17 @@ func TestCLI_E2E_AutoRename(t *testing.T) {
 	store := make(map[string][]byte)
 	var srvURL string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/limits" {
+			writeMockLimits(w)
+			return
+		}
 		switch {
+		case r.Method == "GET" && r.URL.Path == "/v1/limits":
+			json.NewEncoder(w).Encode(map[string]any{
+				"plan": "free", "max_file_bytes": 2147483648, "max_ttl_seconds": 604800,
+				"default_ttl_seconds": 604800, "uploads_per_day": 10,
+				"allowed_ttl_seconds": []int{300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 259200, 345600, 432000, 518400, 604800},
+			})
 		case r.Method == "PUT":
 			data, _ := io.ReadAll(r.Body)
 			store["blob"] = data

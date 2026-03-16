@@ -1,0 +1,270 @@
+package main
+
+import (
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"time"
+)
+
+func runPlan(args []string) error {
+	fs := flag.NewFlagSet("plan", flag.ContinueOnError)
+	var serverVal string
+	fs.StringVar(&serverVal, "server", "https://ttl.space", "server URL")
+	fs.Usage = func() { fmt.Fprintln(os.Stderr, "Usage: ttl plan [--server URL]") }
+	if jsonMode {
+		fs.SetOutput(io.Discard)
+	}
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	apiKey := loadAPIKey()
+	limits, err := fetchLimits(serverVal, apiKey)
+	if err != nil {
+		return err
+	}
+
+	if jsonMode {
+		json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "limits": limits})
+		return nil
+	}
+
+	plan, _ := limits["plan"].(string)
+	fmt.Fprintf(os.Stderr, "Plan: %s\n", plan)
+	fmt.Fprintf(os.Stderr, "Max file size: %s\n", humanBytes(jsonInt64(limits["max_file_bytes"])))
+	fmt.Fprintf(os.Stderr, "Max TTL: %s\n", humanDuration(jsonInt64(limits["max_ttl_seconds"])))
+	fmt.Fprintf(os.Stderr, "Uploads per day: %d\n", int(jsonInt64(limits["uploads_per_day"])))
+
+	if usage, ok := limits["usage"].(map[string]any); ok {
+		fmt.Fprintf(os.Stderr, "\nUsage:\n")
+		fmt.Fprintf(os.Stderr, "  Uploads today: %d\n", int(jsonInt64(usage["uploads_today"])))
+		fmt.Fprintf(os.Stderr, "  Active storage: %s / %s\n",
+			humanBytes(jsonInt64(usage["active_storage_bytes"])),
+			humanBytes(jsonInt64(limits["storage_quota_bytes"])))
+	}
+	return nil
+}
+
+func runList(args []string) error {
+	fs := flag.NewFlagSet("list", flag.ContinueOnError)
+	var serverVal string
+	fs.StringVar(&serverVal, "server", "https://ttl.space", "server URL")
+	fs.Usage = func() { fmt.Fprintln(os.Stderr, "Usage: ttl list [--server URL]") }
+	if jsonMode {
+		fs.SetOutput(io.Discard)
+	}
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	apiKey := loadAPIKey()
+	if apiKey == "" {
+		return fmt.Errorf("No API key configured. Run: ttl activate <key>")
+	}
+
+	listURL, err := url.JoinPath(serverVal, "/v1/files")
+	if err != nil {
+		return fmt.Errorf("Invalid server URL: %w", err)
+	}
+
+	client := newTCPClient(30 * time.Second)
+	req, err := http.NewRequest("GET", listURL, nil)
+	if err != nil {
+		return err
+	}
+	setAPIKeyHeader(req.Header, apiKey)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("Request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 401 {
+		return fmt.Errorf("Invalid or expired API key")
+	}
+	if resp.StatusCode == 403 {
+		return fmt.Errorf("File listing requires an Orbit plan")
+	}
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("Server returned %d", resp.StatusCode)
+	}
+
+	var result struct {
+		Files []struct {
+			Token     string `json:"token"`
+			Link      string `json:"link"`
+			SizeBytes int64  `json:"size_bytes"`
+			CreatedAt int64  `json:"created_at"`
+			ExpiresAt int64  `json:"expires_at"`
+			Burn      bool   `json:"burn"`
+			Expired   bool   `json:"expired"`
+		} `json:"files"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&result); err != nil {
+		return fmt.Errorf("Invalid server response: %w", err)
+	}
+
+	if jsonMode {
+		json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "files": result.Files})
+		return nil
+	}
+
+	if len(result.Files) == 0 {
+		fmt.Fprintln(os.Stderr, "No files found.")
+		return nil
+	}
+
+	for _, f := range result.Files {
+		status := "active"
+		if f.Expired {
+			status = "expired"
+		}
+		if f.Burn {
+			status += " (burn)"
+		}
+		created := time.Unix(f.CreatedAt, 0).Format("2006-01-02 15:04")
+		expires := time.Unix(f.ExpiresAt, 0).Format("2006-01-02 15:04")
+		fmt.Fprintf(os.Stderr, "  %s  %8s  %s → %s  [%s]\n",
+			f.Token, humanBytes(f.SizeBytes), created, expires, status)
+		fmt.Fprintln(os.Stderr, "  "+stripControl(f.Link))
+	}
+	return nil
+}
+
+func runDelete(args []string) error {
+	fs := flag.NewFlagSet("delete", flag.ContinueOnError)
+	var serverVal string
+	fs.StringVar(&serverVal, "server", "https://ttl.space", "server URL")
+	fs.Usage = func() { fmt.Fprintln(os.Stderr, "Usage: ttl delete [--server URL] <token>") }
+	if jsonMode {
+		fs.SetOutput(io.Discard)
+	}
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if fs.NArg() != 1 {
+		return fmt.Errorf("Usage: ttl delete <token>")
+	}
+
+	token := fs.Arg(0)
+	// Accept full URL or bare token
+	if len(token) > 10 {
+		if u, err := url.Parse(token); err == nil && u.Path != "" {
+			parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+			if len(parts) > 0 {
+				token = parts[len(parts)-1]
+			}
+		}
+	}
+	if !isToken(token) {
+		return fmt.Errorf("Invalid token: %s (expected 10 alphanumeric characters)", token)
+	}
+
+	apiKey := loadAPIKey()
+	if apiKey == "" {
+		return fmt.Errorf("No API key configured. Run: ttl activate <key>")
+	}
+
+	deleteURL, err := url.JoinPath(serverVal, "/v1/files/"+token)
+	if err != nil {
+		return fmt.Errorf("Invalid server URL: %w", err)
+	}
+
+	client := newTCPClient(30 * time.Second)
+	req, err := http.NewRequest("DELETE", deleteURL, nil)
+	if err != nil {
+		return err
+	}
+	setAPIKeyHeader(req.Header, apiKey)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("Request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	switch resp.StatusCode {
+	case 204:
+		if jsonMode {
+			json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "token": token, "deleted": true})
+		} else {
+			fmt.Fprintf(os.Stderr, "Deleted: %s\n", token)
+		}
+		return nil
+	case 401:
+		return fmt.Errorf("Invalid or expired API key")
+	case 403:
+		return fmt.Errorf("File deletion requires an Orbit plan")
+	case 404:
+		return fmt.Errorf("File not found or not owned by this key")
+	default:
+		return fmt.Errorf("Server returned %d", resp.StatusCode)
+	}
+}
+
+func fetchLimits(serverURL, apiKey string) (map[string]any, error) {
+	limitsURL, err := url.JoinPath(serverURL, "/v1/limits")
+	if err != nil {
+		return nil, fmt.Errorf("Invalid server URL: %w", err)
+	}
+
+	client := newTCPClient(10 * time.Second)
+	req, err := http.NewRequest("GET", limitsURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	setAPIKeyHeader(req.Header, apiKey)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("Cannot reach server: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 401 {
+		return nil, fmt.Errorf("Invalid or expired API key")
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("Server returned %d", resp.StatusCode)
+	}
+
+	var limits map[string]any
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&limits); err != nil {
+		return nil, fmt.Errorf("Invalid server response: %w", err)
+	}
+	return limits, nil
+}
+
+func jsonInt64(v any) int64 {
+	switch n := v.(type) {
+	case float64:
+		return int64(n)
+	case json.Number:
+		i, _ := n.Int64()
+		return i
+	default:
+		return 0
+	}
+}
+
+func humanDuration(seconds int64) string {
+	switch {
+	case seconds >= 86400:
+		return fmt.Sprintf("%d days", seconds/86400)
+	case seconds >= 3600:
+		return fmt.Sprintf("%d hours", seconds/3600)
+	case seconds >= 60:
+		return fmt.Sprintf("%d minutes", seconds/60)
+	default:
+		return fmt.Sprintf("%d seconds", seconds)
+	}
+}

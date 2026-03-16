@@ -53,6 +53,41 @@ func main() {
 			}
 			exitError(err)
 		}
+	case "activate":
+		if err := runActivate(args[1:]); err != nil {
+			exitError(err)
+		}
+		if jsonMode {
+			json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "activated": true})
+		}
+	case "deactivate":
+		if err := runDeactivate(args[1:]); err != nil {
+			exitError(err)
+		}
+		if jsonMode {
+			json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "deactivated": true})
+		}
+	case "plan":
+		if err := runPlan(args[1:]); err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				os.Exit(0)
+			}
+			exitError(err)
+		}
+	case "list":
+		if err := runList(args[1:]); err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				os.Exit(0)
+			}
+			exitError(err)
+		}
+	case "delete":
+		if err := runDelete(args[1:]); err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				os.Exit(0)
+			}
+			exitError(err)
+		}
 	case "version":
 		if jsonMode {
 			json.NewEncoder(os.Stdout).Encode(map[string]any{
@@ -94,11 +129,16 @@ Default time to live is 7 days.
 Usage:
   ttl send [-p P | --password P | --password-stdin | --password-file F] [-t DUR] [-b] [--json] [--timeout D] FILE
   ttl get  [-p P | --password P | --password-stdin | --password-file F] [--json] [--timeout D] [-o DIR] URL or TOKEN
+  ttl activate <key>           Activate Orbit plan
+  ttl deactivate               Remove stored Orbit key
+  ttl plan                     Show current plan and usage
+  ttl list                     List recent uploads (Orbit)
+  ttl delete <token>           Delete a file early (Orbit)
   ttl version
 
 Options:
   -p, --password P       Encryption/decryption password
-  -t, --ttl DUR          Time to live: 5m,10m,15m,30m,1h,2h,3h,6h,12h,24h,1d,2d,3d,4d,5d,6d,7d (default: 7d)
+  -t, --ttl DUR          Time to live: 5m,10m,15m,30m,1h,2h,3h,6h,12h,24h,1d-7d (default: 7d, Orbit: up to 30d)
   -b, --burn             Burn after reading (file is deleted after first download)
   -o, --output DIR       Output directory for downloaded file (default: current directory)
   --json                 Output JSON to stdout (for scripts and AI agents)
@@ -108,9 +148,12 @@ Options:
   -h3, --http3           Try HTTP/3 (QUIC) first, fall back to TCP if unavailable
 
 Password: Auto-generated if not provided during send.
+  Auto-detected from ttl.password next to binary or ~/.ttl/password.
   -p / --password is visible in ps output and shell history.
   Prefer --password-stdin or --password-file in scripts.
   --json auto-generates a password if none is provided.
+
+Orbit key: Auto-detected from TTL_API_KEY env, ttl.key next to binary, or ~/.ttl/key.
 
 Download: You can pass a full URL or just the 10-character token.
   ttl get aBcDeFgHiJ  is the same as  ttl get https://ttl.space/aBcDeFgHiJ`)

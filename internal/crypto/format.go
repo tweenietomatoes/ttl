@@ -88,7 +88,6 @@ func xorNonce(base [NonceSize]byte, index uint64) []byte {
 	return n
 }
 
-// buildMetadata packs the filename, file size, and chunk size into a byte slice.
 func buildMetadata(filename string, filesize uint64) []byte {
 	fn := []byte(filename)
 	if len(fn) > MaxFilename {
@@ -102,7 +101,6 @@ func buildMetadata(filename string, filesize uint64) []byte {
 	return meta
 }
 
-// parseMetadata reads the filename, file size, and chunk size from a byte slice.
 func parseMetadata(data []byte) (string, uint64, uint32, error) {
 	if len(data) < 14 { // minimum: 1 (fnLen) + 1 (char) + 8 (size) + 4 (chunk)
 		return "", 0, 0, fmt.Errorf("Invalid metadata")
@@ -113,8 +111,8 @@ func parseMetadata(data []byte) (string, uint64, uint32, error) {
 	}
 	filename := string(data[1 : 1+fnLen])
 	filesize := binary.LittleEndian.Uint64(data[1+fnLen:])
-	if filesize > MaxFileBytes {
-		return "", 0, 0, fmt.Errorf("File size too large: %d (max %d)", filesize, MaxFileBytes)
+	if filesize > 1<<40 { // 1 TB sanity cap
+		return "", 0, 0, fmt.Errorf("File size too large: %d", filesize)
 	}
 	chunkSize := binary.LittleEndian.Uint32(data[1+fnLen+8:])
 	if chunkSize == 0 || chunkSize > MaxChunkSize {

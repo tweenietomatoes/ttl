@@ -182,7 +182,7 @@ func TestEncryptedSize_UTF8BoundaryActual(t *testing.T) {
 	// "日" is 3 bytes; 238 ASCII + "日" = 241 bytes total, so truncation
 	// must drop the partial rune and produce a 238-byte filename.
 	names := []string{
-		strings.Repeat("a", 238) + "日.txt",  // 3-byte rune at boundary
+		strings.Repeat("a", 238) + "日.txt",   // 3-byte rune at boundary
 		strings.Repeat("a", 237) + "€€.bin",  // 3-byte rune pair
 		strings.Repeat("a", 236) + "𐍈.dat",   // 4-byte rune at boundary
 		strings.Repeat("a", 235) + "日本語.pdf", // multiple 3-byte runes

@@ -3,12 +3,12 @@ package crypto
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/hkdf"
 )
 
-// DeriveEncKey derives the encryption key from password and salt using Argon2id.
 func DeriveEncKey(password string, salt []byte) []byte {
 	return argon2.IDKey([]byte(password), salt,
 		ArgonTime, ArgonMemory, ArgonThreads, KeySize)
@@ -19,7 +19,7 @@ func DeriveEncKey(password string, salt []byte) []byte {
 func DeriveDownloadToken(encKey []byte) []byte {
 	r := hkdf.Expand(sha256.New, encKey, []byte("ttl-download-token"))
 	token := make([]byte, DownloadTokenSize)
-	r.Read(token) // 32 bytes from SHA-256 HKDF: 1 iteration, cannot fail
+	io.ReadFull(r, token)
 	return token
 }
 

@@ -211,21 +211,37 @@ func TestAttack_Decrypt_WrongPasswordVariations(t *testing.T) {
 
 // --- Metadata forgery ---
 
-// TestAttack_ForgedMetadata_OversizeFilesize builds metadata with file sizes above the limit.
+// TestAttack_ForgedMetadata_OversizeFilesize builds metadata with file sizes above the sanity cap.
 func TestAttack_ForgedMetadata_OversizeFilesize(t *testing.T) {
-	cases := []uint64{
-		MaxFileBytes + 1,     // just over limit
-		MaxFileBytes + 1<<20, // 1 MB over
-		1 << 40,              // 1 TB
-		^uint64(0),           // max uint64
-		^uint64(0) - 1,       // near max uint64
+	// These exceed the 1 TB sanity cap and must be rejected
+	rejected := []uint64{
+		1<<40 + 1,  // just over 1 TB
+		1 << 50,    // 1 PB
+		^uint64(0), // max uint64
+		^uint64(0) - 1,
 	}
-
-	for _, size := range cases {
+	for _, size := range rejected {
 		meta := buildMetadata("evil.bin", size)
 		_, _, _, err := parseMetadata(meta)
 		if err == nil {
 			t.Fatalf("filesize %d should be rejected", size)
+		}
+	}
+
+	// These are within the sanity cap and must be accepted (policy is enforced server-side)
+	accepted := []uint64{
+		MaxFileBytes + 1, // just over 256 MB — valid for Orbit
+		10_737_418_240,   // 10 GB — Orbit max
+		1 << 40,          // 1 TB — at the cap
+	}
+	for _, size := range accepted {
+		meta := buildMetadata("ok.bin", size)
+		_, s, _, err := parseMetadata(meta)
+		if err != nil {
+			t.Fatalf("filesize %d should be accepted: %v", size, err)
+		}
+		if s != size {
+			t.Fatalf("expected %d, got %d", size, s)
 		}
 	}
 }
@@ -650,8 +666,8 @@ func TestAttack_EncryptedSize_ConsistencyCheck(t *testing.T) {
 		strings.Repeat("x", 100),
 		strings.Repeat("x", MaxFilename),
 		strings.Repeat("x", MaxFilename+100),
-		strings.Repeat("a", 238) + "日.txt",  // 3-byte rune at 239 boundary
-		strings.Repeat("a", 236) + "𐍈.dat",   // 4-byte rune at boundary
+		strings.Repeat("a", 238) + "日.txt", // 3-byte rune at 239 boundary
+		strings.Repeat("a", 236) + "𐍈.dat", // 4-byte rune at boundary
 	}
 
 	for _, size := range sizes {

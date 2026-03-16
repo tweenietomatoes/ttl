@@ -290,7 +290,14 @@ func TestAttack_RunSend_MaliciousServerResponses(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv := httptest.NewServer(tc.handler)
+			h := tc.handler
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v1/limits" {
+					writeMockLimits(w)
+					return
+				}
+				h(w, r)
+			}))
 			defer srv.Close()
 
 			path := filepath.Join(t.TempDir(), "test.txt")
@@ -327,13 +334,7 @@ func TestAttack_Password_EdgeCases(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				io.Copy(io.Discard, r.Body)
-				w.WriteHeader(201)
-				json.NewEncoder(w).Encode(map[string]any{
-					"link": "https://ttl.space/aBcDeFgHiJ",
-				})
-			}))
+			srv := mockUploadServer(t)
 			defer srv.Close()
 
 			path := filepath.Join(t.TempDir(), "test.txt")
@@ -352,13 +353,7 @@ func TestAttack_Password_EdgeCases(t *testing.T) {
 
 // TestAttack_PasswordFile_Attacks reads passwords from files with tricky contents.
 func TestAttack_PasswordFile_Attacks(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.Copy(io.Discard, r.Body)
-		w.WriteHeader(201)
-		json.NewEncoder(w).Encode(map[string]any{
-			"link": "https://ttl.space/aBcDeFgHiJ",
-		})
-	}))
+	srv := mockUploadServer(t)
 	defer srv.Close()
 
 	cases := []struct {
@@ -398,13 +393,7 @@ func TestAttack_PasswordFile_Attacks(t *testing.T) {
 
 // TestAttack_PasswordConflictingSources checks that using two password sources at once fails.
 func TestAttack_PasswordConflictingSources(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.Copy(io.Discard, r.Body)
-		w.WriteHeader(201)
-		json.NewEncoder(w).Encode(map[string]any{
-			"link": "https://ttl.space/aBcDeFgHiJ",
-		})
-	}))
+	srv := mockUploadServer(t)
 	defer srv.Close()
 
 	dir := t.TempDir()
@@ -447,7 +436,7 @@ func TestAttack_TTL_ExhaustiveInvalid(t *testing.T) {
 		"7m", "8m", "9m", "11m", "20m", "45m", "60m",
 		"0h", "4h", "5h", "7h", "8h", "9h", "10h", "11h",
 		"13h", "18h", "36h", "48h", "72h", "168h",
-		"1s", "1w", "1y", "8d", "14d", "30d",
+		"1s", "1w", "1y", "8d", "9d", "10d", "16d", "20d", "29d", "31d",
 		"5M", "1H", "24H", // wrong case
 		"-5m", "-1h",
 		"5m ", " 5m", " 5m ", // whitespace
@@ -469,13 +458,7 @@ func TestAttack_TTL_ExhaustiveInvalid(t *testing.T) {
 
 // TestAttack_FileSizeEdgeCases checks that empty files are rejected and 1-byte files are accepted.
 func TestAttack_FileSizeEdgeCases(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.Copy(io.Discard, r.Body)
-		w.WriteHeader(201)
-		json.NewEncoder(w).Encode(map[string]any{
-			"link": "https://ttl.space/aBcDeFgHiJ",
-		})
-	}))
+	srv := mockUploadServer(t)
 	defer srv.Close()
 
 	// Empty file must be rejected
@@ -511,13 +494,7 @@ func TestAttack_NonexistentFile(t *testing.T) {
 
 // TestAttack_SymlinkFile checks that sending a symlink works.
 func TestAttack_SymlinkFile(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.Copy(io.Discard, r.Body)
-		w.WriteHeader(201)
-		json.NewEncoder(w).Encode(map[string]any{
-			"link": "https://ttl.space/aBcDeFgHiJ",
-		})
-	}))
+	srv := mockUploadServer(t)
 	defer srv.Close()
 
 	dir := t.TempDir()
@@ -620,6 +597,8 @@ func TestAttack_E2E_UploadDownloadRoundTrip(t *testing.T) {
 	store := make(map[string][]byte)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.URL.Path == "/v1/limits":
+			writeMockLimits(w)
 		case r.Method == "PUT" && r.URL.Path == "/v1/files":
 			data, _ := io.ReadAll(r.Body)
 			store["test"] = data

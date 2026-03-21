@@ -16,7 +16,11 @@ func runPlan(args []string) error {
 	fs := flag.NewFlagSet("plan", flag.ContinueOnError)
 	var serverVal string
 	fs.StringVar(&serverVal, "server", "https://ttl.space", "server URL")
-	fs.Usage = func() { fmt.Fprintln(os.Stderr, "Usage: ttl plan [--server URL]") }
+	fs.Usage = func() {
+		if !jsonMode {
+			fmt.Fprintln(os.Stderr, "Usage: ttl plan [--server URL]")
+		}
+	}
 	if jsonMode {
 		fs.SetOutput(io.Discard)
 	}
@@ -36,15 +40,20 @@ func runPlan(args []string) error {
 	}
 
 	plan, _ := limits["plan"].(string)
-	fmt.Fprintf(os.Stderr, "Plan: %s\n", plan)
-	fmt.Fprintf(os.Stderr, "Max file size: %s\n", humanBytes(jsonInt64(limits["max_file_bytes"])))
-	fmt.Fprintf(os.Stderr, "Max TTL: %s\n", humanDuration(jsonInt64(limits["max_ttl_seconds"])))
-	fmt.Fprintf(os.Stderr, "Uploads per day: %d\n", int(jsonInt64(limits["uploads_per_day"])))
+	planColor := c(cWhite, cBold)
+	if plan == "orbit" {
+		planColor = c(cBlue, cBold)
+	}
+	fmt.Fprintf(os.Stderr, "%sPlan:%s %s%s%s\n", c(cGray), c(cReset), planColor, plan, c(cReset))
+	fmt.Fprintf(os.Stderr, "%sMax file size:%s %s\n", c(cGray), c(cReset), humanBytes(jsonInt64(limits["max_file_bytes"])))
+	fmt.Fprintf(os.Stderr, "%sMax TTL:%s %s\n", c(cGray), c(cReset), humanDuration(jsonInt64(limits["max_ttl_seconds"])))
+	fmt.Fprintf(os.Stderr, "%sUploads per day:%s %d\n", c(cGray), c(cReset), int(jsonInt64(limits["uploads_per_day"])))
 
 	if usage, ok := limits["usage"].(map[string]any); ok {
-		fmt.Fprintf(os.Stderr, "\nUsage:\n")
-		fmt.Fprintf(os.Stderr, "  Uploads today: %d\n", int(jsonInt64(usage["uploads_today"])))
-		fmt.Fprintf(os.Stderr, "  Active storage: %s / %s\n",
+		fmt.Fprintf(os.Stderr, "\n%sUsage:%s\n", c(cBold), c(cReset))
+		fmt.Fprintf(os.Stderr, "  %sUploads today:%s %d\n", c(cGray), c(cReset), int(jsonInt64(usage["uploads_today"])))
+		fmt.Fprintf(os.Stderr, "  %sActive storage:%s %s / %s\n",
+			c(cGray), c(cReset),
 			humanBytes(jsonInt64(usage["active_storage_bytes"])),
 			humanBytes(jsonInt64(limits["storage_quota_bytes"])))
 	}
@@ -55,7 +64,11 @@ func runList(args []string) error {
 	fs := flag.NewFlagSet("list", flag.ContinueOnError)
 	var serverVal string
 	fs.StringVar(&serverVal, "server", "https://ttl.space", "server URL")
-	fs.Usage = func() { fmt.Fprintln(os.Stderr, "Usage: ttl list [--server URL]") }
+	fs.Usage = func() {
+		if !jsonMode {
+			fmt.Fprintln(os.Stderr, "Usage: ttl list [--server URL]")
+		}
+	}
 	if jsonMode {
 		fs.SetOutput(io.Discard)
 	}
@@ -117,23 +130,31 @@ func runList(args []string) error {
 	}
 
 	if len(result.Files) == 0 {
-		fmt.Fprintln(os.Stderr, "No files found.")
+		fmt.Fprintf(os.Stderr, "%sNo files found.%s\n", c(cGray), c(cReset))
 		return nil
 	}
 
 	for _, f := range result.Files {
 		status := "active"
+		statusColor := c(cGreen)
 		if f.Expired {
 			status = "expired"
+			statusColor = c(cGray)
 		}
 		if f.Burn {
 			status += " (burn)"
+			if !f.Expired {
+				statusColor = c(cAmber)
+			}
 		}
 		created := time.Unix(f.CreatedAt, 0).Format("2006-01-02 15:04")
 		expires := time.Unix(f.ExpiresAt, 0).Format("2006-01-02 15:04")
-		fmt.Fprintf(os.Stderr, "  %s  %8s  %s → %s  [%s]\n",
-			f.Token, humanBytes(f.SizeBytes), created, expires, status)
-		fmt.Fprintln(os.Stderr, "  "+stripControl(f.Link))
+		fmt.Fprintf(os.Stderr, "  %s%s%s  %8s  %s%s → %s%s  %s[%s]%s\n",
+			c(cBold), f.Token, c(cReset),
+			humanBytes(f.SizeBytes),
+			c(cGray), created, expires, c(cReset),
+			statusColor, status, c(cReset))
+		fmt.Fprintf(os.Stderr, "  %s%s%s\n", c(cLightBlue), stripControl(f.Link), c(cReset))
 	}
 	return nil
 }
@@ -142,7 +163,11 @@ func runDelete(args []string) error {
 	fs := flag.NewFlagSet("delete", flag.ContinueOnError)
 	var serverVal string
 	fs.StringVar(&serverVal, "server", "https://ttl.space", "server URL")
-	fs.Usage = func() { fmt.Fprintln(os.Stderr, "Usage: ttl delete [--server URL] <token>") }
+	fs.Usage = func() {
+		if !jsonMode {
+			fmt.Fprintln(os.Stderr, "Usage: ttl delete [--server URL] <token>")
+		}
+	}
 	if jsonMode {
 		fs.SetOutput(io.Discard)
 	}
@@ -197,7 +222,7 @@ func runDelete(args []string) error {
 		if jsonMode {
 			json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "token": token, "deleted": true})
 		} else {
-			fmt.Fprintf(os.Stderr, "Deleted: %s\n", token)
+			fmt.Fprintf(os.Stderr, "%sDeleted:%s %s%s%s\n", c(cGreen), c(cReset), c(cBold), token, c(cReset))
 		}
 		return nil
 	case 401:

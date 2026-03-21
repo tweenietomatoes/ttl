@@ -60,7 +60,11 @@ func runSend(args []string) error {
 
 	var timeoutVal string
 	fs.StringVar(&timeoutVal, "timeout", "", "transfer timeout (e.g. 5m, 1h, auto)")
-	fs.Usage = func() { printUsage() }
+	fs.Usage = func() {
+		if !jsonMode {
+			printUsage()
+		}
+	}
 	if jsonMode {
 		fs.SetOutput(io.Discard)
 	}
@@ -75,22 +79,29 @@ func runSend(args []string) error {
 	// Validate the file before prompting for a password, so the user
 	// is not asked for input when the file path is already invalid.
 	path := fs.Arg(0)
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("Not a regular file: %s", path)
+	}
+	if info.Size() == 0 {
+		return fmt.Errorf("File is empty")
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	info, err := f.Stat()
+	// Validate TTL syntax locally before any network call
+	ttlSeconds, err := parseTTL(ttlVal)
 	if err != nil {
-		return fmt.Errorf("Cannot stat file: %w", err)
+		return err
 	}
-	if info.IsDir() {
-		return fmt.Errorf("Cannot send a directory: %s", path)
-	}
-	if info.Size() == 0 {
-		return fmt.Errorf("File is empty")
-	}
+
 	// Load API key (empty = free tier)
 	apiKey := loadAPIKey()
 
@@ -123,11 +134,6 @@ func runSend(args []string) error {
 		if err != nil {
 			return err
 		}
-	}
-
-	ttlSeconds, err := parseTTL(ttlVal)
-	if err != nil {
-		return err
 	}
 
 	// Pre-validate TTL against server's allowed values
@@ -210,7 +216,7 @@ func runSend(args []string) error {
 			}
 			// QUIC failed, fall back to TCP
 			if !jsonMode {
-				fmt.Fprintln(os.Stderr, "\nH3: Falling back to TCP")
+				fmt.Fprintf(os.Stderr, "\n%sH3: Falling back to TCP%s\n", c(cGray), c(cReset))
 			}
 			// Clean up the failed attempt and retry over TCP
 			cancel()
@@ -279,14 +285,18 @@ func runSend(args []string) error {
 		}
 		json.NewEncoder(os.Stdout).Encode(result)
 	} else {
-		fmt.Fprintf(os.Stderr, "·✧★◉ Thank goodness, %s is in orbit (%s", filepath.Base(path), humanBytes(info.Size()))
+		fmt.Fprintf(os.Stderr, "%s·✧★◉%s Thank goodness, %s%s%s is in orbit %s(%s%s",
+			c(cGold), c(cReset),
+			c(cBold, cTeal), filepath.Base(path), c(cReset),
+			c(cGray), humanBytes(info.Size()), c(cReset))
 		if burnVal {
-			fmt.Fprint(os.Stderr, ", self-destructs after download")
+			fmt.Fprintf(os.Stderr, "%s, self-destructs after download%s", c(cAmber), c(cReset))
 		}
-		fmt.Fprintln(os.Stderr, ")")
-		fmt.Fprintln(os.Stderr, "IMPORTANT! Save your password — required to download and decrypt the file.")
+		fmt.Fprintf(os.Stderr, "%s)%s\n", c(cGray), c(cReset))
+		fmt.Fprintf(os.Stderr, "%s%sIMPORTANT!%s %sSave your password — required to download and decrypt the file.%s\n",
+			c(cAmber), c(cBold), c(cReset), c(cAmber), c(cReset))
 		if generated {
-			fmt.Fprintf(os.Stderr, "Password: %s\n", pass)
+			fmt.Fprintf(os.Stderr, "%sPassword:%s %s%s%s\n", c(cGray), c(cReset), c(cBold, cWhite), pass, c(cReset))
 		}
 		fmt.Println(clean)
 	}
@@ -376,7 +386,7 @@ func resolvePassword(flagValue string, fromStdin bool, fromFile string,
 
 	// Terminal is available — offer to generate a password
 	if allowGenerate {
-		fmt.Fprint(os.Stderr, "No password provided. Generate one? [Y/n]: ")
+		fmt.Fprintf(os.Stderr, "%sNo password provided. Generate one?%s %s[Y/n]%s: ", c(cGray), c(cReset), c(cBold), c(cReset))
 		reader := bufio.NewReader(os.Stdin)
 		answer, _ := reader.ReadString('\n')
 		answer = strings.TrimSpace(strings.ToLower(answer))
@@ -385,13 +395,13 @@ func resolvePassword(flagValue string, fromStdin bool, fromFile string,
 			if err != nil {
 				return "", false, err
 			}
-			fmt.Fprintf(os.Stderr, "Generated password: %s\n", pass)
+			fmt.Fprintf(os.Stderr, "%sGenerated password:%s %s%s%s\n", c(cGray), c(cReset), c(cBold, cWhite), pass, c(cReset))
 			return pass, true, nil
 		}
 	}
 
 	// Prompt the user to type a password
-	fmt.Fprint(os.Stderr, "Enter password: ")
+	fmt.Fprintf(os.Stderr, "%sEnter password:%s ", c(cGray), c(cReset))
 	passBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
 	fmt.Fprintln(os.Stderr)
 	if err != nil {
@@ -408,7 +418,7 @@ func resolvePassword(flagValue string, fromStdin bool, fromFile string,
 		return "", false, fmt.Errorf("Password too short (min %d characters)", minPasswordLength)
 	}
 	if allowGenerate {
-		fmt.Fprint(os.Stderr, "Confirm password: ")
+		fmt.Fprintf(os.Stderr, "%sConfirm password:%s ", c(cGray), c(cReset))
 		confirmBytes, confirmErr := term.ReadPassword(int(os.Stdin.Fd()))
 		fmt.Fprintln(os.Stderr)
 		if confirmErr != nil {
@@ -523,7 +533,7 @@ func resolveTimeout(flag string, transferBytes int64) (time.Duration, error) {
 		if jsonMode {
 			return 0, fmt.Errorf("Invalid timeout: %s", flag)
 		}
-		fmt.Fprintf(os.Stderr, "Warning: Invalid timeout %q, using auto\n", flag)
+		fmt.Fprintf(os.Stderr, "%sWarning:%s Invalid timeout %q, using auto\n", c(cAmber, cBold), c(cReset), flag)
 	}
 	// 1 Mbps = 125000 bytes/sec
 	seconds := float64(transferBytes) / 125000

@@ -71,6 +71,23 @@ func (p *progressReader) Read(buf []byte) (int, error) {
 	return n, err
 }
 
+// barWidth adapts the bar to the terminal width (min 10, max 60, fallback 20).
+func barWidth() int {
+	w, _, err := term.GetSize(int(os.Stderr.Fd()))
+	if err != nil || w < 40 {
+		return 20
+	}
+	// Fixed parts: "1.2 MB / 4.2 MB" (≤17) + gaps (4) + "100%" (4) + suffix (≤22) ≈ 47
+	bw := w - 47
+	if bw < 10 {
+		bw = 10
+	}
+	if bw > 60 {
+		bw = 60
+	}
+	return bw
+}
+
 func (p *progressReader) render() {
 	p.frame++
 
@@ -125,7 +142,10 @@ func (p *progressReader) render() {
 		for i := range spin {
 			spin[i] = compose(i)
 		}
-		fmt.Fprintf(os.Stderr, "\r%s / ∞  %s%s\033[K", humanBytes(shown), string(spin), suffix)
+		fmt.Fprintf(os.Stderr, "\r%s%s%s / ∞  %s%s%s%s%s\033[K",
+			c(cWhite), humanBytes(shown), c(cReset),
+			c(cTeal), string(spin), c(cReset),
+			c(cGray), suffix+c(cReset))
 		return
 	}
 
@@ -133,16 +153,16 @@ func (p *progressReader) render() {
 	if pct > 100 {
 		pct = 100
 	}
-	const w = 30
+	w := barWidth()
 	filled := pct * w / 100
 
-	bar := make([]rune, w)
-	for i := 0; i < w; i++ {
-		if i < filled {
-			bar[i] = compose(i)
-		} else {
-			bar[i] = '·'
-		}
+	filledBar := make([]rune, filled)
+	for i := 0; i < filled; i++ {
+		filledBar[i] = compose(i)
+	}
+	emptyBar := make([]rune, w-filled)
+	for i := range emptyBar {
+		emptyBar[i] = '·'
 	}
 
 	if displaySpeed >= 1 && p.n < p.total {
@@ -155,6 +175,11 @@ func (p *progressReader) render() {
 		}
 	}
 
-	fmt.Fprintf(os.Stderr, "\r%s / %s  %s  %d%%%s\033[K",
-		humanBytes(shown), humanBytes(p.display), string(bar), pct, suffix)
+	fmt.Fprintf(os.Stderr, "\r%s%s%s / %s  %s%s%s%s%s  %s%d%%%s%s\033[K",
+		c(cWhite), humanBytes(shown), c(cReset),
+		humanBytes(p.display),
+		c(cTeal), string(filledBar), c(cReset),
+		c(cGray), string(emptyBar),
+		c(cReset, cBold), pct, c(cReset),
+		c(cGray)+suffix+c(cReset))
 }

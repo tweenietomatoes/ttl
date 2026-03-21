@@ -42,14 +42,14 @@ func main() {
 	case "send":
 		if err := runSend(args[1:]); err != nil {
 			if errors.Is(err, flag.ErrHelp) {
-				os.Exit(0)
+				exitHelp()
 			}
 			exitError(err)
 		}
 	case "get":
 		if err := runGet(args[1:]); err != nil {
 			if errors.Is(err, flag.ErrHelp) {
-				os.Exit(0)
+				exitHelp()
 			}
 			exitError(err)
 		}
@@ -70,21 +70,21 @@ func main() {
 	case "plan":
 		if err := runPlan(args[1:]); err != nil {
 			if errors.Is(err, flag.ErrHelp) {
-				os.Exit(0)
+				exitHelp()
 			}
 			exitError(err)
 		}
 	case "list":
 		if err := runList(args[1:]); err != nil {
 			if errors.Is(err, flag.ErrHelp) {
-				os.Exit(0)
+				exitHelp()
 			}
 			exitError(err)
 		}
 	case "delete":
 		if err := runDelete(args[1:]); err != nil {
 			if errors.Is(err, flag.ErrHelp) {
-				os.Exit(0)
+				exitHelp()
 			}
 			exitError(err)
 		}
@@ -106,6 +106,17 @@ func main() {
 	}
 }
 
+func exitHelp() {
+	if jsonMode {
+		json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"ok":    false,
+			"error": "Use --help without --json for usage information",
+		})
+		os.Exit(0)
+	}
+	os.Exit(0)
+}
+
 func exitError(err error) {
 	if jsonMode {
 		json.NewEncoder(os.Stdout).Encode(map[string]any{
@@ -113,48 +124,90 @@ func exitError(err error) {
 			"error": err.Error(),
 		})
 	} else {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "%sError:%s %v\n", c(cRed, cBold), c(cReset), err)
 	}
 	os.Exit(1)
 }
 
 func printUsage() {
-	fmt.Fprintln(os.Stderr, `ttl.space — End-to-end encrypted ephemeral storage
+	B := c(cBold)          // bold
+	R := c(cReset)         // reset
+	T := c(cBlue, cBold)   // title
+	F := c(cAmber)         // flags
+	D := c(cGray)          // dim/description
+	U := c(cLightBlue)     // url
+	Cm := c(cTeal)         // command
 
-Files are encrypted on your device before upload.
-The server never sees your data or password.
-Passwords are auto-generated during send if not provided.
-Default time to live is 7 days.
+	fmt.Fprintf(os.Stderr, `%sttl.space%s %s— End-to-end encrypted ephemeral storage%s
 
-Usage:
-  ttl send [-p P | --password P | --password-stdin | --password-file F] [-t DUR] [-b] [--json] [--timeout D] FILE
-  ttl get  [-p P | --password P | --password-stdin | --password-file F] [--json] [--timeout D] [-o DIR] URL or TOKEN
-  ttl activate <key>           Activate Orbit plan
-  ttl deactivate               Remove stored Orbit key
-  ttl plan                     Show current plan and usage
-  ttl list                     List recent uploads (Orbit)
-  ttl delete <token>           Delete a file early (Orbit)
-  ttl version
+%sFiles are encrypted on your device before upload.%s
+%sThe server never sees your data or password.%s
+%sPasswords are auto-generated during send if not provided.%s
+%sDefault time to live is 7 days.%s
 
-Options:
-  -p, --password P       Encryption/decryption password
-  -t, --ttl DUR          Time to live: 5m,10m,15m,30m,1h,2h,3h,6h,12h,24h,1d-7d (default: 7d, Orbit: up to 30d)
-  -b, --burn             Burn after reading (file is deleted after first download)
-  -o, --output DIR       Output directory for downloaded file (default: current directory)
-  --json                 Output JSON to stdout (for scripts and AI agents)
-  --timeout D            Transfer timeout (e.g. 5m, 1h). Default: auto (assumes 1 Mbps)
-  --password-stdin       Read password from stdin (for scripts)
-  --password-file F      Read password from file (for scripts)
-  -h3, --http3           Try HTTP/3 (QUIC) first, fall back to TCP if unavailable
+%sUsage:%s
+  %sttl send%s %s[-p P | --password P | --password-stdin | --password-file F] [-t DUR] [-b] [--json] [--timeout D]%s %sFILE%s
+  %sttl get%s  %s[-p P | --password P | --password-stdin | --password-file F] [--json] [--timeout D] [-o DIR]%s %sURL or TOKEN%s
+  %sttl activate%s %s<key>%s           %sActivate Orbit plan%s
+  %sttl deactivate%s               %sRemove stored Orbit key%s
+  %sttl plan%s                     %sShow current plan and usage%s
+  %sttl list%s                     %sList recent uploads (Orbit)%s
+  %sttl delete%s %s<token>%s           %sDelete a file early (Orbit)%s
+  %sttl version%s
 
-Password: Auto-generated if not provided during send.
-  Auto-detected from ttl.password next to binary or ~/.ttl/password.
-  -p / --password is visible in ps output and shell history.
-  Prefer --password-stdin or --password-file in scripts.
-  --json auto-generates a password if none is provided.
+%sOptions:%s
+  %s-p, --password P%s       %sEncryption/decryption password%s
+  %s-t, --ttl DUR%s          %sTime to live: 5m,10m,15m,30m,1h,2h,3h,6h,12h,24h,1d-7d (default: 7d, Orbit: up to 30d)%s
+  %s-b, --burn%s             %sBurn after reading (file is deleted after first download)%s
+  %s-o, --output DIR%s       %sOutput directory for downloaded file (default: current directory)%s
+  %s--json%s                 %sOutput JSON to stdout (for scripts and AI agents)%s
+  %s--timeout D%s            %sTransfer timeout (e.g. 5m, 1h). Default: auto (assumes 1 Mbps)%s
+  %s--password-stdin%s       %sRead password from stdin (for scripts)%s
+  %s--password-file F%s      %sRead password from file (for scripts)%s
+  %s-h3, --http3%s           %sTry HTTP/3 (QUIC) first, fall back to TCP if unavailable%s
 
-Orbit key: Auto-detected from TTL_API_KEY env, ttl.key next to binary, or ~/.ttl/key.
+%sPassword:%s Auto-generated if not provided during send.
+  %sAuto-detected from ttl.password next to binary or ~/.ttl/password.%s
+  %s-p / --password is visible in ps output and shell history.%s
+  %sPrefer --password-stdin or --password-file in scripts.%s
+  %s--json auto-generates a password if none is provided.%s
 
-Download: You can pass a full URL or just the 10-character token.
-  ttl get aBcDeFgHiJ  is the same as  ttl get https://ttl.space/aBcDeFgHiJ`)
+%sOrbit key:%s %sAuto-detected from TTL_API_KEY env, ttl.key next to binary, or ~/.ttl/key.%s
+
+%sDownload:%s You can pass a full URL or just the 10-character token.
+  %sttl get aBcDeFgHiJ%s  is the same as  %sttl get%s %s%s%s
+`,
+		T, R, D, R,
+		D, R,
+		D, R,
+		D, R,
+		D, R,
+		B, R,
+		Cm, R, F, R, B, R,
+		Cm, R, F, R, B, R,
+		Cm, R, B, R, D, R,
+		Cm, R, D, R,
+		Cm, R, D, R,
+		Cm, R, D, R,
+		Cm, R, B, R, D, R,
+		Cm, R,
+		B, R,
+		F, R, D, R,
+		F, R, D, R,
+		F, R, D, R,
+		F, R, D, R,
+		F, R, D, R,
+		F, R, D, R,
+		F, R, D, R,
+		F, R, D, R,
+		F, R, D, R,
+		B, R,
+		D, R,
+		D, R,
+		D, R,
+		D, R,
+		B, R, D, R,
+		B, R,
+		Cm, R, Cm, R, U, "https://ttl.space/aBcDeFgHiJ", R,
+	)
 }

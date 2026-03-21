@@ -36,7 +36,11 @@ func runGet(args []string) error {
 	var outDirVal string
 	fs.StringVar(&outDirVal, "o", "", "output directory")
 	fs.StringVar(&outDirVal, "output", "", "output directory")
-	fs.Usage = func() { printUsage() }
+	fs.Usage = func() {
+		if !jsonMode {
+			printUsage()
+		}
+	}
 	if jsonMode {
 		fs.SetOutput(io.Discard)
 	}
@@ -95,7 +99,7 @@ func runGet(args []string) error {
 				probeResp.Body.Close()
 			}
 			if !jsonMode {
-				fmt.Fprintln(os.Stderr, "\nH3: Falling back to TCP")
+				fmt.Fprintf(os.Stderr, "\n%sH3: Falling back to TCP%s\n", c(cGray), c(cReset))
 			}
 			probeCancel()
 			probeCtx, probeCancel = context.WithTimeout(context.Background(), probeTimeout)
@@ -143,7 +147,7 @@ func runGet(args []string) error {
 		return err
 	}
 	if !jsonMode {
-		fmt.Fprintln(os.Stderr, "Password verified")
+		fmt.Fprintf(os.Stderr, "%sPassword verified%s\n", c(cGreen), c(cReset))
 	}
 
 	// Derive download token for the authenticated download
@@ -185,7 +189,7 @@ func runGet(args []string) error {
 				resp.Body.Close()
 			}
 			if !jsonMode {
-				fmt.Fprintln(os.Stderr, "\nH3: Falling back to TCP")
+				fmt.Fprintf(os.Stderr, "\n%sH3: Falling back to TCP%s\n", c(cGray), c(cReset))
 			}
 			dlCancel()
 			dlCtx, dlCancel = context.WithTimeout(context.Background(), xferTimeout)
@@ -228,9 +232,12 @@ func runGet(args []string) error {
 		json.NewEncoder(os.Stdout).Encode(result)
 	} else {
 		if filename != origName {
-			fmt.Fprintf(os.Stderr, "⚠ %s already exists — saving as %s\n", origName, filename)
+			fmt.Fprintf(os.Stderr, "%s⚠ %s already exists — saving as %s%s\n", c(cAmber), origName, filename, c(cReset))
 		}
-		fmt.Fprintf(os.Stderr, "◉★✧· Phew, %s landed safe and sound (%s)\n", filename, humanBytes(written))
+		fmt.Fprintf(os.Stderr, "%s◉★✧·%s Phew, %s%s%s landed safe and sound %s(%s)%s\n",
+			c(cGold), c(cReset),
+			c(cBold, cTeal), filename, c(cReset),
+			c(cGray), humanBytes(written), c(cReset))
 	}
 	return nil
 }

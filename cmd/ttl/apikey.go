@@ -107,7 +107,7 @@ func runActivate(args []string) error {
 	if jsonMode {
 		return nil // JSON output handled in main
 	}
-	fmt.Fprintf(os.Stderr, "Orbit plan activated. Key saved to %s\n", path)
+	fmt.Fprintf(os.Stderr, "%sOrbit plan activated.%s Key saved to %s%s%s\n", c(cGreen), c(cReset), c(cGray), path, c(cReset))
 	return nil
 }
 
@@ -115,14 +115,17 @@ func runDeactivate(args []string) error {
 	if len(args) != 0 {
 		return fmt.Errorf("Usage: ttl deactivate (no arguments)")
 	}
+
+	var removed, failed []string
+
 	// Try to remove the key file next to the binary
-	removed := false
 	if exe, err := os.Executable(); err == nil {
 		p := filepath.Join(filepath.Dir(exe), keyFileName)
-		if err := os.Remove(p); err == nil {
-			removed = true
-			if !jsonMode {
-				fmt.Fprintf(os.Stderr, "Key file removed: %s\n", p)
+		if _, statErr := os.Stat(p); statErr == nil {
+			if err := os.Remove(p); err == nil {
+				removed = append(removed, p)
+			} else {
+				failed = append(failed, p)
 			}
 		}
 	}
@@ -130,16 +133,27 @@ func runDeactivate(args []string) error {
 	// Also try ~/.ttl/key
 	if home, err := os.UserHomeDir(); err == nil {
 		p := filepath.Join(home, ".ttl", "key")
-		if err := os.Remove(p); err == nil {
-			removed = true
-			if !jsonMode {
-				fmt.Fprintf(os.Stderr, "Key file removed: %s\n", p)
+		if _, statErr := os.Stat(p); statErr == nil {
+			if err := os.Remove(p); err == nil {
+				removed = append(removed, p)
+			} else {
+				failed = append(failed, p)
 			}
 		}
 	}
 
-	if !removed && !jsonMode {
-		fmt.Fprintln(os.Stderr, "No key file found.")
+	if len(failed) > 0 {
+		return fmt.Errorf("Cannot remove key file: %s (check permissions)", failed[0])
+	}
+
+	if jsonMode {
+		return nil
+	}
+	for _, p := range removed {
+		fmt.Fprintf(os.Stderr, "Key file removed: %s%s%s\n", c(cGray), p, c(cReset))
+	}
+	if len(removed) == 0 {
+		fmt.Fprintf(os.Stderr, "%sNo key file found.%s\n", c(cGray), c(cReset))
 	}
 	return nil
 }

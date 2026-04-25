@@ -36,7 +36,7 @@ func VerifyProbe(probeData []byte, encKey []byte) (string, uint64, error) {
 		return "", 0, err
 	}
 
-	// Decrypt metadata — the AEAD tag verifies the password is correct
+	// Decrypt metadata: the AEAD tag verifies the password is correct
 	metaCipher := probeData[HeaderSize : HeaderSize+metaEncLen]
 	metaPlain, err := aead.Open(nil, xorNonce(nonce, 0), metaCipher, nil)
 	if err != nil {

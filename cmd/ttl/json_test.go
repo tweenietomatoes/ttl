@@ -12,7 +12,7 @@ import (
 )
 
 // =============================================================================
-// JSON mode — send
+// JSON mode: send
 // =============================================================================
 
 // A successful --json send must produce a valid JSON object on stdout with
@@ -250,7 +250,7 @@ func TestJSON_Send_DefaultTTL(t *testing.T) {
 }
 
 // =============================================================================
-// JSON mode — get
+// JSON mode: get
 // =============================================================================
 
 // A successful --json get must produce a valid JSON object with filename,
@@ -409,7 +409,7 @@ func TestJSON_Get_SilentStderr(t *testing.T) {
 }
 
 // =============================================================================
-// JSON mode — error scenarios
+// JSON mode: error scenarios
 // =============================================================================
 
 // Wrong password in --json get should return a meaningful error.
@@ -504,7 +504,7 @@ func TestJSON_Send_InvalidTTL(t *testing.T) {
 }
 
 // =============================================================================
-// JSON mode — full E2E round trip (send + get both in JSON mode)
+// JSON mode: full E2E round trip (send + get both in JSON mode)
 // =============================================================================
 
 // The full automation flow: send with --json, parse the response, then get
@@ -604,7 +604,7 @@ func TestJSON_E2E_FullAutomationRoundTrip(t *testing.T) {
 }
 
 // =============================================================================
-// JSON mode — compatibility with other flags
+// JSON mode: compatibility with other flags
 // =============================================================================
 
 // --json + --password-file should work (agent stores password in a tempfile).
@@ -676,7 +676,7 @@ func TestJSON_Send_BurnTrue(t *testing.T) {
 }
 
 // =============================================================================
-// JSON mode — output format guarantees
+// JSON mode: output format guarantees
 // =============================================================================
 
 // JSON output must be exactly one line (no pretty-printing, no trailing
@@ -707,7 +707,7 @@ func TestJSON_Send_SingleLineOutput(t *testing.T) {
 	}
 }
 
-// The JSON output must be parseable by any standard JSON parser — no trailing
+// The JSON output must be parseable by any standard JSON parser: no trailing
 // commas, no comments, no single quotes.
 func TestJSON_Send_StrictJSONParsing(t *testing.T) {
 	srv := mockUploadServer(t)

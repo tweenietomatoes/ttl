@@ -19,9 +19,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Strip global flags before routing to subcommands
+	// Strip global flags before subcommand dispatch. "--" stops scanning
+	// so a positional like a file literally named "--json" gets through.
 	var args []string
+	passthrough := false
 	for _, a := range os.Args[1:] {
+		if passthrough {
+			args = append(args, a)
+			continue
+		}
+		if a == "--" {
+			passthrough = true
+			args = append(args, a)
+			continue
+		}
 		if a == "-h3" || a == "--h3" || a == "-http3" || a == "--http3" {
 			forceH3 = true
 		} else if a == "--json" {
@@ -138,7 +149,7 @@ func printUsage() {
 	U := c(cLightBlue)     // url
 	Cm := c(cTeal)         // command
 
-	fmt.Fprintf(os.Stderr, `%sttl.space%s %s— End-to-end encrypted ephemeral storage%s
+	fmt.Fprintf(os.Stderr, `%sttl.space%s %s— Encrypted file transfer. Ephemeral by design, permanent with Orbit.%s
 
 %sFiles are encrypted on your device before upload.%s
 %sThe server never sees your data or password.%s
@@ -146,7 +157,7 @@ func printUsage() {
 %sDefault time to live is 7 days.%s
 
 %sUsage:%s
-  %sttl send%s %s[-p P | --password P | --password-stdin | --password-file F] [-t DUR] [-b] [--json] [--timeout D]%s %sFILE%s
+  %sttl send%s %s[-p P | --password P | --password-stdin | --password-file F] [-t DUR] [-b] [-u] [--json] [--timeout D]%s %sFILE%s
   %sttl get%s  %s[-p P | --password P | --password-stdin | --password-file F] [--json] [--timeout D] [-o DIR]%s %sURL or TOKEN%s
   %sttl activate%s %s<key>%s           %sActivate Orbit plan%s
   %sttl deactivate%s               %sRemove stored Orbit key%s
@@ -157,8 +168,9 @@ func printUsage() {
 
 %sOptions:%s
   %s-p, --password P%s       %sEncryption/decryption password%s
-  %s-t, --ttl DUR%s          %sTime to live: 5m,10m,15m,30m,1h,2h,3h,6h,12h,24h,1d-7d (default: 7d, Orbit: up to 30d)%s
+  %s-t, --ttl DUR%s          %sTime to live: 5m,10m,15m,30m,1h,2h,3h,6h,12h,24h,1d-7d (default: 7d, Orbit: up to 30d or permanent)%s
   %s-b, --burn%s             %sBurn after reading (file is deleted after first download)%s
+  %s-u, --uploader-only%s    %sPrivate file (Orbit): only the uploader's API key can download it%s
   %s-o, --output DIR%s       %sOutput directory for downloaded file (default: current directory)%s
   %s--json%s                 %sOutput JSON to stdout (for scripts and AI agents)%s
   %s--timeout D%s            %sTransfer timeout (e.g. 5m, 1h). Default: auto (assumes 1 Mbps)%s
@@ -173,6 +185,7 @@ func printUsage() {
   %s--json auto-generates a password if none is provided.%s
 
 %sOrbit key:%s %sAuto-detected from TTL_API_KEY env, ttl.key next to binary, or ~/.ttl/key.%s
+  %sPassed automatically on get/probe so private (uploader-only) files open transparently.%s
 
 %sDownload:%s You can pass a full URL or just the 10-character token.
   %sttl get aBcDeFgHiJ%s  is the same as  %sttl get%s %s%s%s
@@ -201,12 +214,14 @@ func printUsage() {
 		F, R, D, R,
 		F, R, D, R,
 		F, R, D, R,
+		F, R, D, R,
 		B, R,
 		D, R,
 		D, R,
 		D, R,
 		D, R,
 		B, R, D, R,
+		D, R,
 		B, R,
 		Cm, R, Cm, R, U, "https://ttl.space/aBcDeFgHiJ", R,
 	)

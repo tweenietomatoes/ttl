@@ -73,7 +73,7 @@ func TestVerifyProbe_ZeroByteFile(t *testing.T) {
 }
 
 func TestVerifyProbe_MultiChunkFile(t *testing.T) {
-	// File larger than one chunk — probe only has header + metadata
+	// File larger than one chunk: probe only has header + metadata
 	data := make([]byte, ChunkSize+500)
 	rand.Read(data)
 	encrypted := encryptToBuffer(t, data, "big.bin", "password")
@@ -196,12 +196,12 @@ func TestVerifyProbe_BitFlipEveryHeaderByte(t *testing.T) {
 		corruptedKey := argon2.IDKey([]byte("password"), corruptedSalt, ArgonTime, ArgonMemory, ArgonThreads, KeySize)
 
 		if bytes.Equal(corruptedSalt, salt) {
-			// Salt unchanged — use original key, nonce is corrupted
+			// Salt unchanged: use original key, nonce is corrupted
 			if _, _, err := VerifyProbe(corrupted, key); err == nil {
 				t.Fatalf("flipping header byte %d should cause error", i)
 			}
 		} else {
-			// Salt corrupted — key is different, will fail
+			// Salt corrupted: key is different, will fail
 			if _, _, err := VerifyProbe(corrupted, corruptedKey); err == nil {
 				t.Fatalf("flipping salt byte %d should cause error (different key)", i)
 			}

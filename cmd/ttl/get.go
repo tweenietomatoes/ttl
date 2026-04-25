@@ -83,11 +83,15 @@ func runGet(args []string) error {
 		return fmt.Errorf("Invalid URL: %w", err)
 	}
 
+	// Sent on probe + download; needed for uploader-only files, harmless otherwise.
+	apiKey := loadAPIKey()
+
 	doProbe := func(client *http.Client) (*http.Response, error) {
 		req, reqErr := http.NewRequestWithContext(probeCtx, "GET", probeURL, nil)
 		if reqErr != nil {
 			return nil, fmt.Errorf("Invalid URL: %w", reqErr)
 		}
+		setAPIKeyHeader(req.Header, apiKey)
 		return client.Do(req)
 	}
 
@@ -116,7 +120,7 @@ func runGet(args []string) error {
 		return fmt.Errorf("Probe failed: %w", err)
 	}
 
-	// Check status before closing body — handleHTTPError reads it
+	// Check status before closing body: handleHTTPError reads it
 	if probeResp.StatusCode != http.StatusOK {
 		defer probeResp.Body.Close()
 		return handleHTTPError(probeResp)
@@ -151,7 +155,10 @@ func runGet(args []string) error {
 	}
 
 	// Derive download token for the authenticated download
-	downloadToken := crypto.DeriveDownloadToken(encKey)
+	downloadToken, err := crypto.DeriveDownloadToken(encKey)
+	if err != nil {
+		return fmt.Errorf("Token derivation failed: %w", err)
+	}
 	defer func() {
 		for i := range downloadToken {
 			downloadToken[i] = 0
@@ -178,6 +185,7 @@ func runGet(args []string) error {
 		}
 		req.Header.Set("X-Download-Token", tokenHex)
 		req.Header.Set("X-Confirm-Burn", "true")
+		setAPIKeyHeader(req.Header, apiKey)
 		return client.Do(req)
 	}
 
@@ -291,10 +299,6 @@ func parseURL(raw string) (token, baseURL string, err error) {
 		return "", "", fmt.Errorf("Invalid URL: %s", raw)
 	}
 
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return "", "", fmt.Errorf("Invalid URL scheme: %s (http/https only)", u.Scheme)
-	}
-
 	if u.Host == "" {
 		return "", "", fmt.Errorf("Invalid URL: missing host")
 	}
@@ -303,12 +307,51 @@ func parseURL(raw string) (token, baseURL string, err error) {
 		return "", "", fmt.Errorf("Invalid URL: userinfo not allowed")
 	}
 
+	// X-Download-Token and X-API-Key go over plain HTTP otherwise.
+	// Loopback is allowed for httptest and local dev.
+	if err := requireSecureScheme(u); err != nil {
+		return "", "", err
+	}
+
 	token = strings.TrimPrefix(u.Path, "/")
 	if !isToken(token) {
 		return "", "", fmt.Errorf("Invalid token in URL")
 	}
 	baseURL = u.Scheme + "://" + u.Host
 	return token, baseURL, nil
+}
+
+// requireSecureScheme requires https for non-loopback hosts. http is
+// allowed only for localhost / 127.0.0.1 / ::1.
+func requireSecureScheme(u *url.URL) error {
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		host := u.Hostname()
+		if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+			return nil
+		}
+		return fmt.Errorf("Refusing http:// for non-local host %q (use https)", host)
+	default:
+		return fmt.Errorf("Invalid URL scheme: %s (https only, http allowed for localhost)", u.Scheme)
+	}
+}
+
+// validateServerURL applies the same scheme + userinfo policy as parseURL
+// to a `-server` flag value.
+func validateServerURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("Invalid server URL: %w", err)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("Invalid server URL: missing host")
+	}
+	if u.User != nil {
+		return fmt.Errorf("Invalid server URL: userinfo not allowed")
+	}
+	return requireSecureScheme(u)
 }
 
 func handleHTTPError(resp *http.Response) error {

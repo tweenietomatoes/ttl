@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -696,5 +697,123 @@ func TestCLI_E2E_AutoRename(t *testing.T) {
 	}
 	if string(renamed) != "the real content" {
 		t.Fatalf("renamed file has wrong content: %q", string(renamed))
+	}
+}
+
+// --- Header contract: Orbit upload flags (--uploader-only, -t permanent) ---
+//
+// Pins the wire shape against parseTTLHeader / parseUploaderOnlyHeader.
+
+func captureUploadHeaders(t *testing.T, plan string) (*httptest.Server, *http.Header) {
+	t.Helper()
+	captured := http.Header{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/limits" {
+			json.NewEncoder(w).Encode(map[string]any{
+				"plan": plan, "max_file_bytes": 2147483648, "max_ttl_seconds": 2592000,
+				"default_ttl_seconds": 604800, "uploads_per_day": 1000,
+				"allowed_ttl_seconds": []int{300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 259200, 345600, 432000, 518400, 604800, 1209600, 1296000, 2419200, 2592000},
+			})
+			return
+		}
+		// Snapshot headers before draining; body stalls shouldn't lose them.
+		for k, v := range r.Header {
+			captured[k] = v
+		}
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte(`{"link":"https://ttl.space/aBcDeFgHiJ"}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &captured
+}
+
+func TestSend_DefaultUpload_NoOrbitHeaders(t *testing.T) {
+	t.Setenv("TTL_API_KEY", "")
+	t.Setenv("HOME", t.TempDir())
+	srv, hdrs := captureUploadHeaders(t, "free")
+	src := tempFile(t, "x.txt", "hello")
+
+	if err := runSend([]string{"-p", "12345678", "-t", "1h", "-server", srv.URL, src}); err != nil {
+		t.Fatalf("runSend: %v", err)
+	}
+	if got := hdrs.Get("X-TTL"); got != "3600" {
+		t.Fatalf("X-TTL = %q, want %q", got, "3600")
+	}
+	if got := hdrs.Get("X-Uploader-Only"); got != "" {
+		t.Fatalf("X-Uploader-Only should be absent on default upload, got %q", got)
+	}
+	if got := hdrs.Get("X-API-Key"); got != "" {
+		t.Fatalf("X-API-Key should be absent without an activated key, got %q", got)
+	}
+}
+
+func TestSend_UploaderOnly_SendsHeader(t *testing.T) {
+	key := keyPrefix + strings.Repeat("u", 48)
+	t.Setenv("TTL_API_KEY", key)
+	t.Setenv("HOME", t.TempDir())
+	srv, hdrs := captureUploadHeaders(t, "orbit")
+	src := tempFile(t, "x.txt", "hello")
+
+	if err := runSend([]string{"-p", "12345678", "-u", "-server", srv.URL, src}); err != nil {
+		t.Fatalf("runSend: %v", err)
+	}
+	if got := hdrs.Get("X-Uploader-Only"); got != "true" {
+		t.Fatalf("X-Uploader-Only = %q, want %q", got, "true")
+	}
+	if got := hdrs.Get("X-API-Key"); got != key {
+		t.Fatalf("X-API-Key not forwarded on uploader-only PUT (got %q)", got)
+	}
+}
+
+func TestSend_PermanentTTL_SendsSentinel(t *testing.T) {
+	key := keyPrefix + strings.Repeat("p", 48)
+	t.Setenv("TTL_API_KEY", key)
+	t.Setenv("HOME", t.TempDir())
+	srv, hdrs := captureUploadHeaders(t, "orbit")
+	src := tempFile(t, "x.txt", "hello")
+
+	if err := runSend([]string{"-p", "12345678", "-t", "permanent", "-server", srv.URL, src}); err != nil {
+		t.Fatalf("runSend: %v", err)
+	}
+	if got := hdrs.Get("X-TTL"); got != "permanent" {
+		t.Fatalf("X-TTL = %q, want %q", got, "permanent")
+	}
+	if got := hdrs.Get("X-API-Key"); got != key {
+		t.Fatalf("X-API-Key not forwarded on permanent PUT (got %q)", got)
+	}
+}
+
+func TestSend_OrbitFlags_FailFastWithoutKey(t *testing.T) {
+	t.Setenv("TTL_API_KEY", "")
+	t.Setenv("HOME", t.TempDir())
+
+	// Fail-fast must abort before the PUT, not after the upload starts.
+	var putHits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/limits" {
+			writeMockLimits(w)
+			return
+		}
+		atomic.AddInt32(&putHits, 1)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+
+	for _, args := range [][]string{
+		{"-p", "12345678", "-u", "-server", srv.URL},
+		{"-p", "12345678", "-t", "permanent", "-server", srv.URL},
+	} {
+		src := tempFile(t, "x.txt", "hello")
+		err := runSend(append(args, src))
+		if err == nil {
+			t.Fatalf("runSend %v: want fail-fast error, got nil", args)
+		}
+		if !strings.Contains(err.Error(), "Orbit plan API key") {
+			t.Fatalf("runSend %v: error = %q, want Orbit plan API key hint", args, err)
+		}
+	}
+	if n := atomic.LoadInt32(&putHits); n != 0 {
+		t.Fatalf("fail-fast leaked %d PUT requests to the server", n)
 	}
 }

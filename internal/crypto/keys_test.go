@@ -57,7 +57,10 @@ func TestDeriveEncKey_DifferentSalts(t *testing.T) {
 func TestDeriveDownloadToken_Length(t *testing.T) {
 	key := make([]byte, KeySize)
 	rand.Read(key)
-	token := DeriveDownloadToken(key)
+	token, err := DeriveDownloadToken(key)
+	if err != nil {
+		t.Fatalf("DeriveDownloadToken: %v", err)
+	}
 	if len(token) != DownloadTokenSize {
 		t.Fatalf("expected %d bytes, got %d", DownloadTokenSize, len(token))
 	}
@@ -66,8 +69,14 @@ func TestDeriveDownloadToken_Length(t *testing.T) {
 func TestDeriveDownloadToken_Deterministic(t *testing.T) {
 	key := make([]byte, KeySize)
 	rand.Read(key)
-	t1 := DeriveDownloadToken(key)
-	t2 := DeriveDownloadToken(key)
+	t1, err := DeriveDownloadToken(key)
+	if err != nil {
+		t.Fatalf("DeriveDownloadToken t1: %v", err)
+	}
+	t2, err := DeriveDownloadToken(key)
+	if err != nil {
+		t.Fatalf("DeriveDownloadToken t2: %v", err)
+	}
 	if !bytes.Equal(t1, t2) {
 		t.Fatal("same key should produce same download token")
 	}
@@ -78,8 +87,14 @@ func TestDeriveDownloadToken_DifferentKeys(t *testing.T) {
 	k2 := make([]byte, KeySize)
 	rand.Read(k1)
 	rand.Read(k2)
-	t1 := DeriveDownloadToken(k1)
-	t2 := DeriveDownloadToken(k2)
+	t1, err := DeriveDownloadToken(k1)
+	if err != nil {
+		t.Fatalf("DeriveDownloadToken t1: %v", err)
+	}
+	t2, err := DeriveDownloadToken(k2)
+	if err != nil {
+		t.Fatalf("DeriveDownloadToken t2: %v", err)
+	}
 	if bytes.Equal(t1, t2) {
 		t.Fatal("different keys should produce different tokens")
 	}
@@ -88,7 +103,10 @@ func TestDeriveDownloadToken_DifferentKeys(t *testing.T) {
 func TestDeriveDownloadToken_DiffersFromKey(t *testing.T) {
 	key := make([]byte, KeySize)
 	rand.Read(key)
-	token := DeriveDownloadToken(key)
+	token, err := DeriveDownloadToken(key)
+	if err != nil {
+		t.Fatalf("DeriveDownloadToken: %v", err)
+	}
 	if bytes.Equal(token, key) {
 		t.Fatal("download token must differ from encryption key")
 	}
@@ -149,12 +167,18 @@ func TestFullDerivationChain(t *testing.T) {
 	password := "strongpassword!"
 
 	encKey := DeriveEncKey(password, salt)
-	dlToken := DeriveDownloadToken(encKey)
+	dlToken, err := DeriveDownloadToken(encKey)
+	if err != nil {
+		t.Fatalf("DeriveDownloadToken: %v", err)
+	}
 	hash := TokenHash(dlToken)
 
 	// Determinism
 	encKey2 := DeriveEncKey(password, salt)
-	dlToken2 := DeriveDownloadToken(encKey2)
+	dlToken2, err := DeriveDownloadToken(encKey2)
+	if err != nil {
+		t.Fatalf("DeriveDownloadToken: %v", err)
+	}
 	hash2 := TokenHash(dlToken2)
 
 	if !bytes.Equal(encKey, encKey2) {

@@ -289,7 +289,7 @@ func TestCLI_Get_OutputLongFlag(t *testing.T) {
 
 func TestCLI_Get_BareToken(t *testing.T) {
 	// A 10-char alphanumeric string should be treated as a bare token and
-	// expanded to https://ttl.space/TOKEN — verified without a real network call.
+	// expanded to https://ttl.space/TOKEN: verified without a real network call.
 	// The actual network path is tested by TestCLI_Get_FullURL with 127.0.0.1:1.
 	if !isToken("aBcDeFgHiJ") {
 		t.Fatal("aBcDeFgHiJ should be recognised as a bare token")

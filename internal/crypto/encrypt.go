@@ -16,8 +16,11 @@ func EncryptStream(w io.Writer, file io.Reader, filename string,
 		return err
 	}
 
+	// Zero nonce + same key across uploads breaks XChaCha20-Poly1305.
 	var nonce [NonceSize]byte
-	io.ReadFull(rand.Reader, nonce[:])
+	if _, err := io.ReadFull(rand.Reader, nonce[:]); err != nil {
+		return err
+	}
 
 	metaPlain := buildMetadata(filename, fileSize)
 	metaCipher := aead.Seal(nil, xorNonce(nonce, 0), metaPlain, nil)

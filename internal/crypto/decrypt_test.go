@@ -234,7 +234,7 @@ func TestDecrypt_AutoRename_SymlinkConflictChain(t *testing.T) {
 
 	encrypted := encryptToBuffer(t, []byte("payload"), "data.bin", "password")
 
-	// Original is a symlink, (1) is a regular file — should land on (2)
+	// Original is a symlink, (1) is a regular file: should land on (2)
 	target := filepath.Join(dir, "target.bin")
 	os.WriteFile(target, []byte("symlink target"), 0644)
 	os.Symlink(target, filepath.Join(dir, "data.bin"))
@@ -265,7 +265,7 @@ func TestDecrypt_AutoRename_SymlinkAtCandidatePath(t *testing.T) {
 
 	encrypted := encryptToBuffer(t, []byte("payload"), "notes.txt", "password")
 
-	// Both original and (1) are symlinks — should skip both and land on (2)
+	// Both original and (1) are symlinks: should skip both and land on (2)
 	target := filepath.Join(dir, "real.txt")
 	os.WriteFile(target, []byte("real"), 0644)
 	os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("orig"), 0644)

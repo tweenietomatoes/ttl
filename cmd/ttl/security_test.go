@@ -2,14 +2,17 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // --- URL parsing ---
@@ -76,10 +79,10 @@ func TestAttack_ParseURL_ValidEdgeCases(t *testing.T) {
 		{"https://ttl.space/abcdefghij", "abcdefghij", "https://ttl.space"},
 		// Mixed
 		{"https://ttl.space/aB3dEf7hIj", "aB3dEf7hIj", "https://ttl.space"},
-		// IP address host
+		// IP host (https only; non-loopback http rejected, see negative test)
 		{"https://192.168.1.1:8080/aBcDeFgHiJ", "aBcDeFgHiJ", "https://192.168.1.1:8080"},
-		// HTTP (not HTTPS)
-		{"http://ttl.space/aBcDeFgHiJ", "aBcDeFgHiJ", "http://ttl.space"},
+		// Loopback over http (httptest)
+		{"http://127.0.0.1:38999/aBcDeFgHiJ", "aBcDeFgHiJ", "http://127.0.0.1:38999"},
 	}
 
 	for _, tc := range validURLs {
@@ -95,6 +98,186 @@ func TestAttack_ParseURL_ValidEdgeCases(t *testing.T) {
 				t.Fatalf("base = %q, want %q", base, tc.wantBase)
 			}
 		})
+	}
+}
+
+// http:// for non-loopback hosts must fail; bearer tokens and API key go
+// in headers and would otherwise leak in cleartext.
+func TestParseURL_RejectsHTTPDowngrade(t *testing.T) {
+	cases := []string{
+		"http://ttl.space/aBcDeFgHiJ",
+		"http://example.com/aBcDeFgHiJ",
+		"http://192.168.1.1/aBcDeFgHiJ",
+		"ftp://ttl.space/aBcDeFgHiJ",
+		"file:///etc/passwd",
+	}
+	for _, raw := range cases {
+		if _, _, err := parseURL(raw); err == nil {
+			t.Fatalf("parseURL(%q) should reject non-https non-loopback URL", raw)
+		}
+	}
+}
+
+// stripControl must remove bidi overrides, zero-width and BOM so a
+// malicious server can't render a phishing token via U+202E.
+func TestStripControl_RemovesBidiAndZeroWidth(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		// U+202E right-to-left override
+		{"https://ttl.space/aBcD\u202EgnpEfgH", "https://ttl.space/aBcDgnpEfgH"},
+		// U+2066 left-to-right isolate
+		{"https://ttl.space/\u2066aBcDeFgHiJ", "https://ttl.space/aBcDeFgHiJ"},
+		// U+200B zero-width space
+		{"https://ttl.space/aBcD\u200beFgHiJ", "https://ttl.space/aBcDeFgHiJ"},
+		// U+FEFF BOM (\u escape; literal BOM is a Go parser error)
+		{"\ufeffhttps://ttl.space/aBcDeFgHiJ", "https://ttl.space/aBcDeFgHiJ"},
+		// Control char regression
+		{"https://ttl.space/aBcD\nEvIL", "https://ttl.space/aBcDEvIL"},
+		// ASCII pass-through
+		{"https://ttl.space/aBcDeFgHiJ", "https://ttl.space/aBcDeFgHiJ"},
+	}
+	for _, tc := range cases {
+		got := stripControl(tc.in)
+		if got != tc.want {
+			t.Fatalf("stripControl(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// scrubBinaryAdjacentKey wipes the binary-adjacent ttl.key before and
+// after a test. saveAPIKey writes there first, and a leftover would
+// pollute loadAPIKey() in later tests.
+func scrubBinaryAdjacentKey(t *testing.T) {
+	t.Helper()
+	if exe, err := os.Executable(); err == nil {
+		p := filepath.Join(filepath.Dir(exe), keyFileName)
+		_ = os.Remove(p)
+		t.Cleanup(func() { _ = os.Remove(p) })
+	}
+}
+
+// saveAPIKey must refuse a pre-planted symlink at the destination. To
+// reach the HOME fallback, the binary-adjacent path is also symlinked
+// so writeKeyAtomic rejects it first.
+func TestSaveAPIKey_RefusesSymlink(t *testing.T) {
+	scrubBinaryAdjacentKey(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("TTL_API_KEY", "")
+
+	// Plant a symlink at the binary-adjacent path so writeKeyAtomic
+	// rejects it and falls through to HOME.
+	if exe, err := os.Executable(); err == nil {
+		p := filepath.Join(filepath.Dir(exe), keyFileName)
+		bait := filepath.Join(home, "binary-bait.txt")
+		_ = os.WriteFile(bait, []byte("bait"), 0600)
+		_ = os.Remove(p)
+		if err := os.Symlink(bait, p); err != nil {
+			t.Skipf("Symlinks not supported on this filesystem: %v", err)
+		}
+	}
+
+	dir := filepath.Join(home, ".ttl")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(home, "attacker-owned.txt")
+	if err := os.WriteFile(target, []byte("planted"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dir, "key")
+	if err := os.Symlink(target, dst); err != nil {
+		t.Skipf("Symlinks not supported on this filesystem: %v", err)
+	}
+
+	key := keyPrefix + strings.Repeat("x", 48)
+	_, err := saveAPIKey(key)
+	if err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("saveAPIKey should refuse symlink target, got err=%v", err)
+	}
+	got, _ := os.ReadFile(target)
+	if string(got) != "planted" {
+		t.Fatalf("symlink target was modified: %q", string(got))
+	}
+}
+
+// Temp+rename path: regular file, 0600, no .ttl-key-* leftovers.
+func TestSaveAPIKey_AtomicReplace(t *testing.T) {
+	scrubBinaryAdjacentKey(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("TTL_API_KEY", "")
+
+	key := keyPrefix + strings.Repeat("x", 48)
+	path, err := saveAPIKey(key)
+	if err != nil {
+		t.Fatalf("saveAPIKey: %v", err)
+	}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("destination is a symlink")
+	}
+	if perm := fi.Mode().Perm(); perm != 0600 {
+		t.Fatalf("perm = %o, want 0600", perm)
+	}
+	got, _ := os.ReadFile(path)
+	if string(got) != key+"\n" {
+		t.Fatalf("file contents = %q", string(got))
+	}
+	entries, _ := os.ReadDir(filepath.Dir(path))
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".ttl-key-") {
+			t.Fatalf("leftover tempfile: %s", e.Name())
+		}
+	}
+}
+
+// Auto-generated password length must stay ≥ 12 (~71 bits).
+func TestGeneratePassword_DefaultLength(t *testing.T) {
+	if generatedPasswordLength < 12 {
+		t.Fatalf("generatedPasswordLength = %d, want >= 12", generatedPasswordLength)
+	}
+}
+
+// activate: --key-stdin and positional <key> together must fail.
+func TestRunActivate_RefusesArgvAndStdinTogether(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("TTL_API_KEY", "")
+	key := keyPrefix + strings.Repeat("x", 48)
+	err := runActivate([]string{"--key-stdin", key})
+	if err == nil || !strings.Contains(err.Error(), "Use only one of") {
+		t.Fatalf("expected exclusivity error, got %v", err)
+	}
+}
+
+// TLS 1.3 pinned on both transports.
+func TestNewTCPClient_PinsTLS13(t *testing.T) {
+	c := newTCPClient(5 * time.Second)
+	tr, ok := c.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("expected *http.Transport, got %T", c.Transport)
+	}
+	if tr.TLSClientConfig == nil || tr.TLSClientConfig.MinVersion != tls.VersionTLS13 {
+		t.Fatalf("TLS MinVersion not pinned to 1.3 on TCP client")
+	}
+}
+
+func TestNewH3Client_PinsTLS13(t *testing.T) {
+	c := newH3Client()
+	// Reflect to avoid pinning quic-go's exact transport shape.
+	v := reflect.ValueOf(c.Transport).Elem().FieldByName("TLSClientConfig")
+	if !v.IsValid() || v.IsNil() {
+		t.Fatalf("H3 transport missing TLSClientConfig")
+	}
+	cfg, ok := v.Interface().(*tls.Config)
+	if !ok || cfg.MinVersion != tls.VersionTLS13 {
+		t.Fatalf("TLS MinVersion not pinned to 1.3 on H3 client")
 	}
 }
 
@@ -366,7 +549,11 @@ func TestAttack_PasswordFile_Attacks(t *testing.T) {
 		{"empty file", "", true},
 		{"only newline", "\n", true},
 		{"too short", "short\n", true},
-		{"very long password", strings.Repeat("X", 10000) + "\n", false},
+		// 4 KiB cap; previously 10 KB was silently truncated to 64 KiB.
+		{"very long password (over 4 KiB cap)", strings.Repeat("X", 10000) + "\n", true},
+		{"long password just under cap", strings.Repeat("Y", 4000) + "\n", false},
+		// UTF-8 BOM trimmed so the saved password matches what was typed.
+		{"password with UTF-8 BOM", "\ufeffmypassword123\n", false},
 		{"unicode password", "日本語パスワード!\n", false},
 		{"multiple lines", "password1234\nsecond line\nthird line\n", false}, // uses first line only
 	}
@@ -419,12 +606,15 @@ func TestAttack_PasswordConflictingSources(t *testing.T) {
 // TestAttack_TTL_ExhaustiveValid checks every allowed TTL value.
 func TestAttack_TTL_ExhaustiveValid(t *testing.T) {
 	for label, expected := range labelToSeconds {
-		got, err := parseTTL(label)
+		got, perm, err := parseTTL(label)
 		if err != nil {
 			t.Fatalf("parseTTL(%q) error: %v", label, err)
 		}
 		if got != expected {
 			t.Fatalf("parseTTL(%q) = %d, want %d", label, got, expected)
+		}
+		if perm {
+			t.Fatalf("parseTTL(%q) returned isPermanent=true for a numeric TTL", label)
 		}
 	}
 }
@@ -447,9 +637,22 @@ func TestAttack_TTL_ExhaustiveInvalid(t *testing.T) {
 	}
 
 	for _, label := range invalids {
-		_, err := parseTTL(label)
+		_, _, err := parseTTL(label)
 		if err == nil {
 			t.Fatalf("parseTTL(%q) should fail", label)
+		}
+	}
+}
+
+// "permanent" parses to (0, true). Plan check happens elsewhere.
+func TestPermanentTTL_Accepted(t *testing.T) {
+	for _, label := range []string{"permanent", "Permanent", "PERMANENT"} {
+		secs, perm, err := parseTTL(label)
+		if err != nil {
+			t.Fatalf("parseTTL(%q) error: %v", label, err)
+		}
+		if secs != 0 || !perm {
+			t.Fatalf("parseTTL(%q) = (%d, %v), want (0, true)", label, secs, perm)
 		}
 	}
 }
@@ -655,7 +858,10 @@ func TestAttack_E2E_UploadDownloadRoundTrip(t *testing.T) {
 func TestAttack_RandomBytes_NonDeterministic(t *testing.T) {
 	seen := make(map[string]bool)
 	for i := 0; i < 1000; i++ {
-		b := randomBytes(16)
+		b, err := randomBytes(16)
+		if err != nil {
+			t.Fatalf("randomBytes: %v", err)
+		}
 		key := string(b)
 		if seen[key] {
 			t.Fatal("randomBytes returned duplicate value!")
@@ -667,7 +873,10 @@ func TestAttack_RandomBytes_NonDeterministic(t *testing.T) {
 // TestAttack_RandomBytes_Length checks that the returned slice has the requested length.
 func TestAttack_RandomBytes_Length(t *testing.T) {
 	for _, length := range []int{1, 8, 16, 24, 32, 64, 256, 1024} {
-		b := randomBytes(length)
+		b, err := randomBytes(length)
+		if err != nil {
+			t.Fatalf("randomBytes(%d): %v", length, err)
+		}
 		if len(b) != length {
 			t.Fatalf("randomBytes(%d) returned %d bytes", length, len(b))
 		}

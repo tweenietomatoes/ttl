@@ -28,6 +28,9 @@ func runPlan(args []string) error {
 		return err
 	}
 
+	if err := validateServerURL(serverVal); err != nil {
+		return err
+	}
 	apiKey := loadAPIKey()
 	limits, err := fetchLimits(serverVal, apiKey)
 	if err != nil {
@@ -44,9 +47,14 @@ func runPlan(args []string) error {
 	if plan == "orbit" {
 		planColor = c(cBlue, cBold)
 	}
-	fmt.Fprintf(os.Stderr, "%sPlan:%s %s%s%s\n", c(cGray), c(cReset), planColor, plan, c(cReset))
+	// Server-controlled string; strip ANSI/format chars before printing.
+	fmt.Fprintf(os.Stderr, "%sPlan:%s %s%s%s\n", c(cGray), c(cReset), planColor, stripControl(plan), c(cReset))
 	fmt.Fprintf(os.Stderr, "%sMax file size:%s %s\n", c(cGray), c(cReset), humanBytes(jsonInt64(limits["max_file_bytes"])))
-	fmt.Fprintf(os.Stderr, "%sMax TTL:%s %s\n", c(cGray), c(cReset), humanDuration(jsonInt64(limits["max_ttl_seconds"])))
+	maxTTL := humanDuration(jsonInt64(limits["max_ttl_seconds"]))
+	if plan == "orbit" {
+		maxTTL += " (or permanent)"
+	}
+	fmt.Fprintf(os.Stderr, "%sMax TTL:%s %s\n", c(cGray), c(cReset), maxTTL)
 	fmt.Fprintf(os.Stderr, "%sUploads per day:%s %d\n", c(cGray), c(cReset), int(jsonInt64(limits["uploads_per_day"])))
 
 	if usage, ok := limits["usage"].(map[string]any); ok {
@@ -56,6 +64,26 @@ func runPlan(args []string) error {
 			c(cGray), c(cReset),
 			humanBytes(jsonInt64(usage["active_storage_bytes"])),
 			humanBytes(jsonInt64(limits["storage_quota_bytes"])))
+	}
+
+	// Red banner when subscription ended; permanent files are queued for
+	// hard delete at perm_grace_until.
+	if grace := jsonInt64(limits["perm_grace_until"]); grace > 0 {
+		deadline := time.Unix(grace, 0)
+		remaining := grace - time.Now().Unix()
+		fmt.Fprintf(os.Stderr, "\n%s%sPermanent files at risk:%s your subscription has ended.\n",
+			c(cRed), c(cBold), c(cReset))
+		if remaining <= 0 {
+			fmt.Fprintf(os.Stderr, "  %sHard delete window:%s %s%s%s (deadline passed — purge in progress)\n",
+				c(cGray), c(cReset),
+				c(cRed, cBold), deadline.Format("2006-01-02 15:04 MST"), c(cReset))
+		} else {
+			fmt.Fprintf(os.Stderr, "  %sHard delete on:%s %s%s%s (%s remaining)\n",
+				c(cGray), c(cReset),
+				c(cRed, cBold), deadline.Format("2006-01-02 15:04 MST"), c(cReset),
+				humanDuration(remaining))
+		}
+		fmt.Fprintf(os.Stderr, "  %sRenew at:%s https://ttl.space/orbit\n", c(cGray), c(cReset))
 	}
 	return nil
 }
@@ -76,6 +104,9 @@ func runList(args []string) error {
 		return err
 	}
 
+	if err := validateServerURL(serverVal); err != nil {
+		return err
+	}
 	apiKey := loadAPIKey()
 	if apiKey == "" {
 		return fmt.Errorf("No API key configured. Run: ttl activate <key>")
@@ -111,13 +142,16 @@ func runList(args []string) error {
 
 	var result struct {
 		Files []struct {
-			Token     string `json:"token"`
-			Link      string `json:"link"`
-			SizeBytes int64  `json:"size_bytes"`
-			CreatedAt int64  `json:"created_at"`
-			ExpiresAt int64  `json:"expires_at"`
-			Burn      bool   `json:"burn"`
-			Expired   bool   `json:"expired"`
+			Token          string `json:"token"`
+			Link           string `json:"link"`
+			SizeBytes      int64  `json:"size_bytes"`
+			CreatedAt      int64  `json:"created_at"`
+			ExpiresAt      int64  `json:"expires_at"`
+			Burn           bool   `json:"burn"`
+			Expired        bool   `json:"expired"`
+			UploaderOnly   bool   `json:"uploader_only"`
+			IsPermanent    bool   `json:"is_permanent"`
+			PermGraceUntil int64  `json:"perm_grace_until"`
 		} `json:"files"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&result); err != nil {
@@ -147,13 +181,34 @@ func runList(args []string) error {
 				statusColor = c(cAmber)
 			}
 		}
+		// perm_grace_until > 0 means "subscription ended, hard delete at this time".
+		if f.IsPermanent && !f.Expired && f.PermGraceUntil > 0 {
+			status = "grace (until " + time.Unix(f.PermGraceUntil, 0).Format("2006-01-02 15:04") + ")"
+			statusColor = c(cRed)
+		}
 		created := time.Unix(f.CreatedAt, 0).Format("2006-01-02 15:04")
-		expires := time.Unix(f.ExpiresAt, 0).Format("2006-01-02 15:04")
-		fmt.Fprintf(os.Stderr, "  %s%s%s  %8s  %s%s → %s%s  %s[%s]%s\n",
+		// Pad to timestamp width so "permanent" rows line up.
+		var expiresCol string
+		if f.IsPermanent {
+			expiresCol = "permanent"
+		} else {
+			expiresCol = time.Unix(f.ExpiresAt, 0).Format("2006-01-02 15:04")
+		}
+		// Server-controlled; reject anything outside the 10 base62 schema
+		// so a malformed entry can't smuggle ANSI through the bold wrapper.
+		if !isToken(f.Token) {
+			fmt.Fprintf(os.Stderr, "  %s[skipped: invalid token]%s\n", c(cAmber), c(cReset))
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "  %s%s%s  %8s  %s%s → %-16s%s  %s[%s]%s",
 			c(cBold), f.Token, c(cReset),
 			humanBytes(f.SizeBytes),
-			c(cGray), created, expires, c(cReset),
+			c(cGray), created, expiresCol, c(cReset),
 			statusColor, status, c(cReset))
+		if f.UploaderOnly {
+			fmt.Fprintf(os.Stderr, " %s[private]%s", c(cBlue), c(cReset))
+		}
+		fmt.Fprintln(os.Stderr)
 		fmt.Fprintf(os.Stderr, "  %s%s%s\n", c(cLightBlue), stripControl(f.Link), c(cReset))
 	}
 	return nil
@@ -177,6 +232,10 @@ func runDelete(args []string) error {
 
 	if fs.NArg() != 1 {
 		return fmt.Errorf("Usage: ttl delete <token>")
+	}
+
+	if err := validateServerURL(serverVal); err != nil {
+		return err
 	}
 
 	token := fs.Arg(0)

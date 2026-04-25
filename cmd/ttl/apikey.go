@@ -1,10 +1,15 @@
 package main
 
 import (
+	"bufio"
+	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/term"
 )
 
 const keyPrefix = "ttl_orbit_"
@@ -47,7 +52,7 @@ func saveAPIKey(key string) (string, error) {
 	// Try binary-adjacent first
 	if exe, err := os.Executable(); err == nil {
 		p := filepath.Join(filepath.Dir(exe), keyFileName)
-		if err := os.WriteFile(p, []byte(key+"\n"), 0600); err == nil {
+		if err := writeKeyAtomic(p, key); err == nil {
 			return p, nil
 		}
 	}
@@ -60,11 +65,55 @@ func saveAPIKey(key string) (string, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", fmt.Errorf("Cannot create key directory: %w", err)
 	}
+	// Tighten existing dir perms (some dotfile managers create at 0755).
+	_ = os.Chmod(dir, 0700)
 	p := filepath.Join(dir, "key")
-	if err := os.WriteFile(p, []byte(key+"\n"), 0600); err != nil {
-		return "", fmt.Errorf("Cannot write key file: %w", err)
+	if err := writeKeyAtomic(p, key); err != nil {
+		return "", err
 	}
 	return p, nil
+}
+
+// writeKeyAtomic writes key to dst via tempfile + rename. Refuses to
+// follow symlinks (multi-user box pre-planted symlink attack) and avoids
+// torn writes that would otherwise leave dst empty on Ctrl-C.
+func writeKeyAtomic(dst, key string) error {
+	if fi, err := os.Lstat(dst); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("Refusing to write key: %s is a symlink", dst)
+		}
+	}
+	dir := filepath.Dir(dst)
+	tmp, err := os.CreateTemp(dir, ".ttl-key-*")
+	if err != nil {
+		return fmt.Errorf("Cannot create temp key file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	cleanup := func() { _ = os.Remove(tmpPath) }
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		cleanup()
+		return fmt.Errorf("Cannot set key file perms: %w", err)
+	}
+	if _, err := tmp.WriteString(key + "\n"); err != nil {
+		tmp.Close()
+		cleanup()
+		return fmt.Errorf("Cannot write key file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		cleanup()
+		return fmt.Errorf("Cannot fsync key file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return fmt.Errorf("Cannot close key file: %w", err)
+	}
+	if err := os.Rename(tmpPath, dst); err != nil {
+		cleanup()
+		return fmt.Errorf("Cannot install key file: %w", err)
+	}
+	return nil
 }
 
 func validateKeyFormat(key string) error {
@@ -90,20 +139,99 @@ func setAPIKeyHeader(r interface{ Set(string, string) }, key string) {
 }
 
 func runActivate(args []string) error {
-	if len(args) != 1 {
-		return fmt.Errorf("Usage: ttl activate <api-key>")
+	fs := flag.NewFlagSet("activate", flag.ContinueOnError)
+	var keyStdin bool
+	fs.BoolVar(&keyStdin, "key-stdin", false, "read the API key from stdin")
+	var keyFile string
+	fs.StringVar(&keyFile, "key-file", "", "read the API key from a file")
+	fs.Usage = func() {
+		if !jsonMode {
+			fmt.Fprintln(os.Stderr, "Usage: ttl activate [--key-stdin | --key-file F | <key>]")
+		}
 	}
-
-	key := strings.TrimSpace(args[0])
-	if err := validateKeyFormat(key); err != nil {
+	if jsonMode {
+		fs.SetOutput(io.Discard)
+	}
+	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
+	// stdin > file > positional. Positional kept for backward compat but
+	// leaks the key to /proc and shell history.
+	sources := 0
+	if keyStdin {
+		sources++
+	}
+	if keyFile != "" {
+		sources++
+	}
+	if fs.NArg() > 0 {
+		sources++
+	}
+	if sources == 0 {
+		// Interactive prompt; also keeps the key out of argv/history.
+		if !term.IsTerminal(int(os.Stdin.Fd())) {
+			return fmt.Errorf("No key provided; use --key-stdin or --key-file")
+		}
+		fmt.Fprintf(os.Stderr, "%sEnter Orbit API key:%s ", c(cGray), c(cReset))
+		raw, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Fprintln(os.Stderr)
+		if err != nil {
+			return fmt.Errorf("Failed to read key")
+		}
+		return activateWithKey(strings.TrimSpace(string(raw)))
+	}
+	if sources > 1 {
+		return fmt.Errorf("Use only one of: --key-stdin, --key-file, or positional <key>")
+	}
+
+	switch {
+	case keyStdin:
+		// First line only; keys are 58 chars.
+		br := bufio.NewReader(os.Stdin)
+		line, err := br.ReadString('\n')
+		if err != nil && err != io.EOF {
+			return fmt.Errorf("Failed to read key from stdin: %w", err)
+		}
+		return activateWithKey(strings.TrimSpace(line))
+	case keyFile != "":
+		// 4 KiB cap; misconfigured --key-file (/dev/zero, log) shouldn't OOM.
+		f, err := os.Open(keyFile)
+		if err != nil {
+			return fmt.Errorf("Cannot read key file: %w", err)
+		}
+		defer f.Close()
+		raw, err := io.ReadAll(io.LimitReader(f, 4096))
+		if err != nil {
+			return fmt.Errorf("Cannot read key file: %w", err)
+		}
+		if i := strings.IndexAny(string(raw), "\r\n"); i >= 0 {
+			raw = raw[:i]
+		}
+		return activateWithKey(strings.TrimSpace(string(raw)))
+	default:
+		if fs.NArg() != 1 {
+			return fmt.Errorf("Usage: ttl activate [--key-stdin | --key-file F | <key>]")
+		}
+		// Positional still works but warn once (silent in JSON mode).
+		if !jsonMode {
+			fmt.Fprintf(os.Stderr, "%sNote:%s passing the key on the command line exposes it via /proc and shell history.\n      Prefer %s--key-stdin%s or %s--key-file%s.\n",
+				c(cAmber, cBold), c(cReset),
+				c(cBold), c(cReset),
+				c(cBold), c(cReset))
+		}
+		return activateWithKey(strings.TrimSpace(fs.Arg(0)))
+	}
+}
+
+func activateWithKey(key string) error {
+	if err := validateKeyFormat(key); err != nil {
+		return err
+	}
 	path, err := saveAPIKey(key)
 	if err != nil {
 		return err
 	}
-
 	if jsonMode {
 		return nil // JSON output handled in main
 	}

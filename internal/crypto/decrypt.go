@@ -148,7 +148,7 @@ func DecryptStreamWithKey(r io.Reader, key []byte, outDir string) (string, strin
 		}
 	}
 
-	// First chunk (or EOF for 0-byte) verified — safe to create the output file
+	// First chunk (or EOF for 0-byte) verified: safe to create the output file
 	originalFilename := filename
 	outPath, filename, err = findAvailablePath(outDir, filename)
 	if err != nil {
@@ -238,14 +238,14 @@ func findAvailablePath(dir, filename string) (outPath string, actualName string,
 		if !os.IsNotExist(statErr) {
 			return "", "", fmt.Errorf("Cannot check path: %w", statErr)
 		}
-		// Path doesn't exist — use original name
+		// Path doesn't exist: use original name
 		return outPath, filename, nil
 	}
 	if fi.IsDir() {
 		return "", "", fmt.Errorf("Directory already exists: %s", filename)
 	}
 
-	// File or symlink exists — try sequential suffixes
+	// File or symlink exists: try sequential suffixes
 	ext := filepath.Ext(filename)
 	base := strings.TrimSuffix(filename, ext)
 
@@ -265,9 +265,11 @@ func findAvailablePath(dir, filename string) (outPath string, actualName string,
 		}
 	}
 
-	// All (1)–(99) taken: use a random 2-byte hex suffix
+	// (1)..(99) all taken: random 2-byte hex suffix.
 	var rnd [2]byte
-	io.ReadFull(rand.Reader, rnd[:])
+	if _, err := io.ReadFull(rand.Reader, rnd[:]); err != nil {
+		return "", "", fmt.Errorf("Random suffix generation failed: %w", err)
+	}
 	suffix := fmt.Sprintf(" (%x)", rnd)
 	candidate := truncatedCandidate(base, suffix, ext)
 	if candidate == "" {
@@ -333,7 +335,7 @@ func sanitizeFilename(name string) string {
 	if name == "" || name == "." {
 		name = "download.bin"
 	}
-	// Block Windows reserved device names (CON, PRN, NUL, AUX, COM1–9, LPT1–9)
+	// Block Windows reserved device names (CON, PRN, NUL, AUX, COM1-9, LPT1-9)
 	base := strings.ToUpper(name)
 	if dot := strings.IndexByte(base, '.'); dot >= 0 {
 		base = base[:dot]

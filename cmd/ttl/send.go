@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"golang.org/x/term"
@@ -55,6 +56,11 @@ func runSend(args []string) error {
 	fs.BoolVar(&burnVal, "b", false, "burn after reading (single download)")
 	fs.BoolVar(&burnVal, "burn", false, "burn after reading (single download)")
 
+	var uploaderOnlyVal bool
+	fs.BoolVar(&uploaderOnlyVal, "u", false, "uploader-only download (Orbit, requires same API key to download)")
+	fs.BoolVar(&uploaderOnlyVal, "uploader-only", false, "uploader-only download (Orbit, requires same API key to download)")
+	fs.BoolVar(&uploaderOnlyVal, "private", false, "uploader-only download (Orbit, requires same API key to download)")
+
 	var serverVal string
 	fs.StringVar(&serverVal, "server", "https://ttl.space", "server URL")
 
@@ -74,6 +80,10 @@ func runSend(args []string) error {
 
 	if fs.NArg() != 1 {
 		return fmt.Errorf("Usage: ttl send [-p PASS] [-t DUR] [-b] FILE")
+	}
+
+	if err := validateServerURL(serverVal); err != nil {
+		return err
 	}
 
 	// Validate the file before prompting for a password, so the user
@@ -97,13 +107,22 @@ func runSend(args []string) error {
 	defer f.Close()
 
 	// Validate TTL syntax locally before any network call
-	ttlSeconds, err := parseTTL(ttlVal)
+	ttlSeconds, isPermanent, err := parseTTL(ttlVal)
 	if err != nil {
 		return err
 	}
 
 	// Load API key (empty = free tier)
 	apiKey := loadAPIKey()
+
+	// Fail fast on Orbit-only flags without a key, before the server's 400.
+	if (uploaderOnlyVal || isPermanent) && apiKey == "" {
+		feature := "Uploader-only mode"
+		if isPermanent {
+			feature = "Permanent storage"
+		}
+		return fmt.Errorf("%s requires an Orbit plan API key\nRun: ttl activate <key>", feature)
+	}
 
 	// Fetch server-side limits (respects plan tier)
 	serverLimits, limitsErr := fetchLimits(serverVal, apiKey)
@@ -120,11 +139,11 @@ func runSend(args []string) error {
 			humanBytes(info.Size()), humanBytes(maxFileBytes))
 	}
 
-	// In JSON mode without explicit password, auto-generate one
+	// JSON mode + no explicit password: auto-generate.
 	var pass string
 	var generated bool
 	if jsonMode && passwordVal == "" && !passwordStdinVal && passwordFileVal == "" {
-		pass, err = generatePassword(8)
+		pass, err = generatePassword(generatedPasswordLength)
 		if err != nil {
 			return err
 		}
@@ -136,27 +155,37 @@ func runSend(args []string) error {
 		}
 	}
 
-	// Pre-validate TTL against server's allowed values
-	if allowed, ok := serverLimits["allowed_ttl_seconds"].([]any); ok {
-		found := false
-		for _, v := range allowed {
-			if int(jsonInt64(v)) == ttlSeconds {
-				found = true
-				break
+	// Permanent isn't in allowed_ttl_seconds; the server gates it via
+	// X-TTL=permanent + Orbit key, and the local check above already
+	// covers the free tier.
+	if !isPermanent {
+		if allowed, ok := serverLimits["allowed_ttl_seconds"].([]any); ok {
+			found := false
+			for _, v := range allowed {
+				if int(jsonInt64(v)) == ttlSeconds {
+					found = true
+					break
+				}
 			}
-		}
-		if !found {
-			plan, _ := serverLimits["plan"].(string)
-			if plan == "free" {
-				return fmt.Errorf("TTL %s is not available on the free plan (max 7d)\nUpgrade to Orbit for up to 30 days: https://ttl.space", ttlVal)
+			if !found {
+				plan, _ := serverLimits["plan"].(string)
+				if plan == "free" {
+					return fmt.Errorf("TTL %s is not available on the free plan (max 7d)\nUpgrade to Orbit for up to 30 days: https://ttl.space", ttlVal)
+				}
+				return fmt.Errorf("Invalid TTL %s for your plan", ttlVal)
 			}
-			return fmt.Errorf("Invalid TTL %s for your plan", ttlVal)
 		}
 	}
 
-	salt := randomBytes(crypto.SaltSize)
+	salt, err := randomBytes(crypto.SaltSize)
+	if err != nil {
+		return err
+	}
 	key := crypto.DeriveEncKey(pass, salt)
-	downloadToken := crypto.DeriveDownloadToken(key)
+	downloadToken, err := crypto.DeriveDownloadToken(key)
+	if err != nil {
+		return fmt.Errorf("Token derivation failed: %w", err)
+	}
 	tokenHash := crypto.TokenHash(downloadToken)
 	defer func() {
 		for i := range key {
@@ -198,11 +227,18 @@ func runSend(args []string) error {
 		}
 		req.ContentLength = encSize
 		req.Header.Set("Content-Type", "application/octet-stream")
-		req.Header.Set("X-TTL", strconv.Itoa(ttlSeconds))
+		if isPermanent {
+			req.Header.Set("X-TTL", "permanent")
+		} else {
+			req.Header.Set("X-TTL", strconv.Itoa(ttlSeconds))
+		}
 		req.Header.Set("X-Token-Hash", tokenHash)
 		setAPIKeyHeader(req.Header, apiKey)
 		if burnVal {
 			req.Header.Set("X-Burn-After-Reading", "true")
+		}
+		if uploaderOnlyVal {
+			req.Header.Set("X-Uploader-Only", "true")
 		}
 		return client.Do(req)
 	}
@@ -273,12 +309,14 @@ func runSend(args []string) error {
 	clean := stripControl(result.Link)
 	if jsonMode {
 		result := map[string]any{
-			"ok":       true,
-			"link":     clean,
-			"filename": filepath.Base(path),
-			"size":     info.Size(),
-			"ttl":      ttlVal,
-			"burn":     burnVal,
+			"ok":            true,
+			"link":          clean,
+			"filename":      filepath.Base(path),
+			"size":          info.Size(),
+			"ttl":           ttlVal,
+			"burn":          burnVal,
+			"uploader_only": uploaderOnlyVal,
+			"is_permanent":  isPermanent,
 		}
 		if generated {
 			result["password"] = pass
@@ -292,6 +330,12 @@ func runSend(args []string) error {
 		if burnVal {
 			fmt.Fprintf(os.Stderr, "%s, self-destructs after download%s", c(cAmber), c(cReset))
 		}
+		if isPermanent {
+			fmt.Fprintf(os.Stderr, "%s, permanent%s", c(cBlue), c(cReset))
+		}
+		if uploaderOnlyVal {
+			fmt.Fprintf(os.Stderr, "%s, private — uploader's API key required to download%s", c(cBlue), c(cReset))
+		}
 		fmt.Fprintf(os.Stderr, "%s)%s\n", c(cGray), c(cReset))
 		fmt.Fprintf(os.Stderr, "%s%sIMPORTANT!%s %sSave your password — required to download and decrypt the file.%s\n",
 			c(cAmber), c(cBold), c(cReset), c(cAmber), c(cReset))
@@ -304,6 +348,32 @@ func runSend(args []string) error {
 }
 
 const minPasswordLength = 8
+
+// 12 chars × base62 ≈ 71.5 bits.
+const generatedPasswordLength = 12
+
+// 4 KiB caps password file reads; past this is almost certainly a typo
+// (--password-file pointed at /dev/zero, a log, etc.).
+const passwordReadLimit = 4 * 1024
+
+// readBoundedFirstLine reads the first line of r, capped at passwordReadLimit.
+// Strips UTF-8 BOM and trailing CR/LF.
+func readBoundedFirstLine(r io.Reader, source string) (string, error) {
+	br := bufio.NewReader(io.LimitReader(r, passwordReadLimit+1))
+	line, err := br.ReadString('\n')
+	if err != nil && err != io.EOF {
+		return "", fmt.Errorf("Failed to read %s: %w", source, err)
+	}
+	if len(line) > passwordReadLimit {
+		return "", fmt.Errorf("Password from %s exceeds %d bytes", source, passwordReadLimit)
+	}
+	line = strings.TrimRight(line, "\r\n")
+	line = strings.TrimPrefix(line, "\ufeff")
+	if line == "" {
+		return "", fmt.Errorf("Empty %s", source)
+	}
+	return line, nil
+}
 
 func resolvePassword(flagValue string, fromStdin bool, fromFile string,
 	allowGenerate bool) (string, bool, error) {
@@ -333,13 +403,9 @@ func resolvePassword(flagValue string, fromStdin bool, fromFile string,
 
 	// From stdin
 	if fromStdin {
-		scanner := bufio.NewScanner(os.Stdin)
-		if !scanner.Scan() {
-			return "", false, fmt.Errorf("Failed to read password from stdin")
-		}
-		pass := scanner.Text()
-		if pass == "" {
-			return "", false, fmt.Errorf("Empty password from stdin")
+		pass, err := readBoundedFirstLine(os.Stdin, "stdin")
+		if err != nil {
+			return "", false, err
 		}
 		if utf8.RuneCountInString(pass) < minPasswordLength {
 			return "", false, fmt.Errorf("Password too short (min %d characters)", minPasswordLength)
@@ -347,21 +413,16 @@ func resolvePassword(flagValue string, fromStdin bool, fromFile string,
 		return pass, false, nil
 	}
 
-	// From a file (reads only the first line)
+	// From a file (first line only, bounded)
 	if fromFile != "" {
 		f, err := os.Open(fromFile)
 		if err != nil {
 			return "", false, fmt.Errorf("Cannot read password file: %w", err)
 		}
-		scanner := bufio.NewScanner(f)
-		if !scanner.Scan() {
-			f.Close()
-			return "", false, fmt.Errorf("Empty password file")
-		}
-		pass := strings.TrimRight(scanner.Text(), "\r")
+		pass, err := readBoundedFirstLine(f, "password file")
 		f.Close()
-		if pass == "" {
-			return "", false, fmt.Errorf("Empty password file")
+		if err != nil {
+			return "", false, err
 		}
 		if utf8.RuneCountInString(pass) < minPasswordLength {
 			return "", false, fmt.Errorf("Password too short (min %d characters)", minPasswordLength)
@@ -369,29 +430,35 @@ func resolvePassword(flagValue string, fromStdin bool, fromFile string,
 		return pass, false, nil
 	}
 
-	// Check for ttl.password file (binary-adjacent, then ~/.ttl/password)
+	// ttl.password auto-detect (binary-adjacent, then ~/.ttl/password)
 	for _, p := range passwordFilePaths() {
-		if raw, err := os.ReadFile(p); err == nil {
-			pass := strings.TrimSpace(string(raw))
-			if pass != "" && utf8.RuneCountInString(pass) >= minPasswordLength {
-				return pass, false, nil
-			}
+		f, err := os.Open(p)
+		if err != nil {
+			continue
+		}
+		pass, err := readBoundedFirstLine(f, "ttl.password file")
+		f.Close()
+		if err != nil {
+			continue
+		}
+		if utf8.RuneCountInString(pass) >= minPasswordLength {
+			return pass, false, nil
 		}
 	}
 
-	// No terminal and no password given — cannot prompt
+	// No terminal and no password given: cannot prompt
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
 		return "", false, fmt.Errorf("No password provided; use --password-stdin or --password-file")
 	}
 
-	// Terminal is available — offer to generate a password
+	// Terminal is available: offer to generate a password
 	if allowGenerate {
 		fmt.Fprintf(os.Stderr, "%sNo password provided. Generate one?%s %s[Y/n]%s: ", c(cGray), c(cReset), c(cBold), c(cReset))
 		reader := bufio.NewReader(os.Stdin)
 		answer, _ := reader.ReadString('\n')
 		answer = strings.TrimSpace(strings.ToLower(answer))
 		if answer == "" || answer == "y" || answer == "yes" {
-			pass, err := generatePassword(8)
+			pass, err := generatePassword(generatedPasswordLength)
 			if err != nil {
 				return "", false, err
 			}
@@ -450,12 +517,15 @@ func generatePassword(length int) (string, error) {
 	return string(result), nil
 }
 
-func parseTTL(label string) (int, error) {
+func parseTTL(label string) (int, bool, error) {
+	if strings.EqualFold(label, "permanent") {
+		return 0, true, nil
+	}
 	seconds, ok := labelToSeconds[label]
 	if !ok {
-		return 0, fmt.Errorf("Invalid duration: %s (use 5m,10m,15m,30m,1h,2h,3h,6h,12h,24h,1d,2d,3d,4d,5d,6d,7d,14d,15d,28d,30d)", label)
+		return 0, false, fmt.Errorf("Invalid duration: %s (use 5m,10m,15m,30m,1h,2h,3h,6h,12h,24h,1d,2d,3d,4d,5d,6d,7d,14d,15d,28d,30d,permanent)", label)
 	}
-	return seconds, nil
+	return seconds, false, nil
 }
 
 func humanBytes(b int64) string {
@@ -482,15 +552,25 @@ func passwordFilePaths() []string {
 	return paths
 }
 
-func randomBytes(n int) []byte {
+// randomBytes returns n bytes from crypto/rand. A zero salt would make
+// Argon2id deterministic for the same password.
+func randomBytes(n int) ([]byte, error) {
 	b := make([]byte, n)
-	io.ReadFull(rand.Reader, b)
-	return b
+	if _, err := io.ReadFull(rand.Reader, b); err != nil {
+		return nil, fmt.Errorf("Random generation failed: %w", err)
+	}
+	return b, nil
 }
 
+// stripControl drops C0/C1 control bytes and Unicode format chars
+// (bidi overrides, zero-width, BOM) from server-controlled strings
+// before printing, so a malicious link can't hijack the terminal.
 func stripControl(s string) string {
 	return strings.Map(func(r rune) rune {
 		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			return -1
+		}
+		if unicode.Is(unicode.Cf, r) {
 			return -1
 		}
 		return r

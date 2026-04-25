@@ -92,8 +92,8 @@ func (p *progressReader) render() {
 	p.frame++
 
 	// Two flowing layers, nothing static:
-	//   bg     — twinkling stardust, slow drift  (period 5, half speed)
-	//   planet — rare planet flyby                (period 19, full speed)
+	//   bg    : twinkling stardust, slow drift  (period 5, half speed)
+	//   planet: rare planet flyby                (period 19, full speed)
 	bg := []rune{'·', '·', '·', '✧', ' '}
 	planet := []rune{
 		' ', ' ', ' ', ' ', ' ', ' ', ' ',

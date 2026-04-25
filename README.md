@@ -1,10 +1,10 @@
 # ttl
 
-CLI for [ttl.space](https://ttl.space) — end-to-end encrypted ephemeral storage.
+CLI for [ttl.space](https://ttl.space) — Encrypted file transfer. Ephemeral by design, permanent with Orbit.
 
 🔒 Files are encrypted on your device before upload. The server only stores ciphertext — it never sees your data, your password, or your filename.
 
-⏱️ Every file has a time-to-live. When it expires, the server deletes it permanently.
+⏱️ Every file has a time-to-live. When it expires, the server deletes it permanently. With Orbit you can also pin files as **permanent** (kept until you cancel) and lock them to **uploader-only** (only your API key can download).
 
 🤖 **AI-agent ready** — `--json` mode provides structured input/output with auto-generated passwords, deterministic exit codes, and machine-parseable errors. No interactive prompts, no terminal required.
 
@@ -94,13 +94,15 @@ A second attempt returns an error — the file no longer exists.
 
 ## 🪐 Orbit plan
 
-[Orbit](https://ttl.space/orbit) unlocks larger files, longer retention, and more uploads.
+[Orbit](https://ttl.space/orbit) unlocks larger files, longer retention, permanent storage, uploader-only locks, and a 500 GB pool.
 
 The Orbit key is auto-detected (first match wins):
 
 1. `TTL_API_KEY` environment variable
 2. `ttl.key` next to the binary
 3. `~/.ttl/key`
+
+When `ttl get` runs with a key configured, it is sent automatically so private (uploader-only) files open transparently.
 
 ```
 $ ttl activate ttl_orbit_aBcDeFgHiJ...
@@ -109,14 +111,23 @@ Orbit plan activated. Key saved to /usr/local/bin/ttl.key
 $ ttl plan
 Plan: orbit
 Max file size: 10.0 GB
-Max TTL: 30 days
-Uploads per day: 50
+Max TTL: 30 days (or permanent)
+Uploads per day: 1000000
+
+Usage:
+  Uploads today: 3
+  Active storage: 4.2 GB / 500.0 GB
 
 $ ttl send -t 30d large-backup.tar.gz
+
+$ ttl send -u -t permanent secrets.tar.zst
+·✧★◉ Thank goodness, secrets.tar.zst is in orbit (12.5 MB, permanent, private — uploader's API key required to download)
 
 $ ttl list
   xK9mQ2vLpA    4.2 MB  2026-03-16 10:30 → 2026-04-15 10:30  [active]
   https://ttl.space/xK9mQ2vLpA
+  yL3nR7wKqB   12.5 MB  2026-04-20 09:12 → permanent          [active] [private]
+  https://ttl.space/yL3nR7wKqB
 
 $ ttl delete xK9mQ2vLpA
 Deleted: xK9mQ2vLpA
@@ -125,10 +136,37 @@ $ ttl deactivate
 Key file removed: /usr/local/bin/ttl.key
 ```
 
+### 🔐 Uploader-only (private) files
+
+Add `-u` / `--uploader-only` (or `--private`) on send to require the uploader's API key on download. Even with the link and the password, anyone without the key gets a 404 (probe) or 403 (download) — indistinguishable from a wrong-password response.
+
+```
+$ ttl send -u -t 1d board-minutes.pdf
+·✧★◉ Thank goodness, board-minutes.pdf is in orbit (240.0 KB, private — uploader's API key required to download)
+
+$ TTL_API_KEY="" ttl get aBcDeFgHiJ
+Error: Link not found
+
+$ ttl get aBcDeFgHiJ          # API key auto-loaded — opens fine
+Password verified
+◉★✧· Phew, board-minutes.pdf landed safe and sound (240.0 KB)
+```
+
+### ♾️ Permanent storage
+
+`-t permanent` skips the TTL entirely. The file stays until you delete it or your subscription ends. After cancellation a 48-hour grace window arms before hard delete; `ttl plan` displays a red banner with the deadline.
+
+```
+$ ttl send -t permanent design-archive.zip
+·✧★◉ Thank goodness, design-archive.zip is in orbit (1.2 GB, permanent)
+```
+
+Both flags compose: `ttl send -u -t permanent ...`.
+
 ## 📋 Usage
 
 ```
-ttl send [-p P] [-t DUR] [-b] [--json] [--timeout D] FILE
+ttl send [-p P] [-t DUR] [-b] [-u] [--json] [--timeout D] FILE
 ttl get  [-p P] [--json] [--timeout D] [-o DIR] URL or TOKEN
 ttl activate <key>
 ttl deactivate
@@ -143,6 +181,7 @@ ttl version
 | `-p, --password P` | Encryption / decryption password |
 | `-t, --ttl DUR` | Time to live (default: `7d`). See [valid values](#ttl-values) below. |
 | `-b, --burn` | Burn after reading — deleted after first download |
+| `-u, --uploader-only` | Private file (Orbit) — only the uploader's API key can download. Aliases: `--private` |
 | `-o, --output DIR` | Output directory (default: current directory) |
 | `--timeout D` | Transfer timeout (e.g. `5m`, `1h`). Default: auto (assumes 1 Mbps) |
 | `--password-stdin` | Read password from stdin |
@@ -154,7 +193,7 @@ ttl version
 
 Free tier: `5m` `10m` `15m` `30m` `1h` `2h` `3h` `6h` `12h` `24h` `1d` `2d` `3d` `4d` `5d` `6d` `7d`
 
-Orbit adds: `14d` `15d` `28d` `30d`
+Orbit adds: `14d` `15d` `28d` `30d` `permanent`
 
 ## 💡 Examples
 
@@ -177,6 +216,18 @@ Burn after reading — file is permanently deleted after the first download:
 
 ```
 ttl send -b confidential.pdf
+```
+
+Lock to your API key (private file, Orbit):
+
+```
+ttl send -u board-minutes.pdf
+```
+
+Pin a file as permanent (Orbit):
+
+```
+ttl send -t permanent design-archive.zip
 ```
 
 Download to a specific directory:
@@ -218,7 +269,7 @@ Minimum password length is 8 characters. Only one explicit source (`-p`, `--pass
 
 ```
 $ ttl --json send report.pdf
-{"ok":true,"link":"https://ttl.space/xK9mQ2vLpA","filename":"report.pdf","size":2097152,"ttl":"7d","burn":false,"password":"aB3kL9mX"}
+{"ok":true,"link":"https://ttl.space/xK9mQ2vLpA","filename":"report.pdf","size":2097152,"ttl":"7d","burn":false,"uploader_only":false,"is_permanent":false,"password":"aB3kL9mX"}
 
 $ ttl --json get -p aB3kL9mX xK9mQ2vLpA
 {"ok":true,"filename":"report.pdf","size":2097152,"saved_to":"/home/user/report.pdf"}
@@ -284,10 +335,11 @@ Limits are fetched from the server at upload time and depend on your plan.
 | Limit | Free | Orbit |
 |-------|------|-------|
 | Max file size | 2 GB | 10 GB |
-| Max retention | 7 days | 30 days |
-| Uploads per day | 10 | 50 |
-| Storage quota | — | 100 GB |
+| Max retention | 7 days | 30 days, or permanent |
+| Uploads per day | 10 | effectively unlimited |
+| Storage quota | — | 500 GB (expandable) |
 | Delete & list | — | ✓ |
+| Uploader-only (private) | — | ✓ |
 | Min password | 8 characters | 8 characters |
 | Requests per IP | 30 per 10 seconds | 30 per 10 seconds |
 

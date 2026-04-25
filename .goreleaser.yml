@@ -16,9 +16,123 @@ builds:
       - linux
       - darwin
       - windows
+      - freebsd
+      - openbsd
+      - netbsd
+      - dragonfly
+      - illumos
+      - solaris
     goarch:
       - amd64
       - arm64
+      - arm
+      - "386"
+      - riscv64
+      - ppc64le
+      - s390x
+      - loong64
+    goarm:
+      - "6"
+      - "7"
+    ignore:
+      # darwin: only amd64 + arm64 (merged into universal)
+      - goos: darwin
+        goarch: arm
+      - goos: darwin
+        goarch: "386"
+      - goos: darwin
+        goarch: riscv64
+      - goos: darwin
+        goarch: ppc64le
+      - goos: darwin
+        goarch: s390x
+      - goos: darwin
+        goarch: loong64
+      # windows: 386, amd64, arm64
+      - goos: windows
+        goarch: arm
+      - goos: windows
+        goarch: riscv64
+      - goos: windows
+        goarch: ppc64le
+      - goos: windows
+        goarch: s390x
+      - goos: windows
+        goarch: loong64
+      # freebsd: 386, amd64, arm/v6, arm/v7, arm64
+      - goos: freebsd
+        goarch: ppc64le
+      - goos: freebsd
+        goarch: s390x
+      - goos: freebsd
+        goarch: loong64
+      # openbsd: 386, amd64, arm/v7, arm64
+      - goos: openbsd
+        goarch: arm
+        goarm: "6"
+      - goos: openbsd
+        goarch: riscv64
+      - goos: openbsd
+        goarch: ppc64le
+      - goos: openbsd
+        goarch: s390x
+      - goos: openbsd
+        goarch: loong64
+      # netbsd: 386, amd64, arm/v7, arm64
+      - goos: netbsd
+        goarch: arm
+        goarm: "6"
+      - goos: netbsd
+        goarch: riscv64
+      - goos: netbsd
+        goarch: ppc64le
+      - goos: netbsd
+        goarch: s390x
+      - goos: netbsd
+        goarch: loong64
+      # dragonfly / illumos / solaris: amd64 only
+      - goos: dragonfly
+        goarch: arm64
+      - goos: dragonfly
+        goarch: arm
+      - goos: dragonfly
+        goarch: "386"
+      - goos: dragonfly
+        goarch: riscv64
+      - goos: dragonfly
+        goarch: ppc64le
+      - goos: dragonfly
+        goarch: s390x
+      - goos: dragonfly
+        goarch: loong64
+      - goos: illumos
+        goarch: arm64
+      - goos: illumos
+        goarch: arm
+      - goos: illumos
+        goarch: "386"
+      - goos: illumos
+        goarch: riscv64
+      - goos: illumos
+        goarch: ppc64le
+      - goos: illumos
+        goarch: s390x
+      - goos: illumos
+        goarch: loong64
+      - goos: solaris
+        goarch: arm64
+      - goos: solaris
+        goarch: arm
+      - goos: solaris
+        goarch: "386"
+      - goos: solaris
+        goarch: riscv64
+      - goos: solaris
+        goarch: ppc64le
+      - goos: solaris
+        goarch: s390x
+      - goos: solaris
+        goarch: loong64
 
 universal_binaries:
   - replace: true
@@ -26,7 +140,7 @@ universal_binaries:
 archives:
   - formats:
       - tar.gz
-    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
     files:
       - LICENCE
       - README.md
@@ -34,6 +148,31 @@ archives:
       - goos: windows
         formats:
           - zip
+
+nfpms:
+  - id: ttl
+    package_name: ttl
+    vendor: tweenietomatoes
+    homepage: "https://ttl.space"
+    maintainer: "Emre Temelkuran <emre@temelkuran.ist>"
+    description: "Encrypted file transfer. Ephemeral by design, permanent with Orbit."
+    license: MIT
+    formats:
+      - deb
+      - rpm
+      - apk
+    bindir: /usr/bin
+    contents:
+      - src: LICENCE
+        dst: /usr/share/doc/ttl/LICENCE
+      - src: README.md
+        dst: /usr/share/doc/ttl/README.md
+
+sboms:
+  - id: archive
+    artifacts: archive
+  - id: package
+    artifacts: package
 
 checksum:
   name_template: "checksums.txt"
@@ -47,6 +186,38 @@ signs:
       - "${artifact}"
       - "--yes"
     artifacts: checksum
+
+docker_signs:
+  - cmd: cosign
+    args:
+      - "sign"
+      - "--yes"
+      - "${artifact}@${digest}"
+    artifacts: manifests
+    output: true
+
+dockers_v2:
+  - id: ttl
+    images:
+      - "ghcr.io/tweenietomatoes/ttl"
+    tags:
+      - "{{ .Version }}"
+      - "latest"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+      - linux/arm/v7
+    dockerfile: Dockerfile
+    ids:
+      - ttl
+    labels:
+      org.opencontainers.image.title: "{{ .ProjectName }}"
+      org.opencontainers.image.description: "Encrypted file transfer. Ephemeral by design, permanent with Orbit."
+      org.opencontainers.image.url: "https://ttl.space"
+      org.opencontainers.image.source: "https://github.com/tweenietomatoes/ttl"
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.licenses: "MIT"
 
 release:
   github:
@@ -62,7 +233,7 @@ homebrew_casks:
       name: homebrew-ttl
       token: "{{ .Env.REPO_PUBLISH_TOKEN }}"
     homepage: "https://ttl.space"
-    description: "E2E Encrypted Ephemeral Storage"
+    description: "Encrypted file transfer. Ephemeral by design, permanent with Orbit."
     commit_msg_template: "update {{ .ProjectName }} to {{ .Tag }}"
     commit_author:
       name: tweenietomatoes
@@ -75,7 +246,7 @@ scoops:
       name: scoop-ttl
       token: "{{ .Env.REPO_PUBLISH_TOKEN }}"
     homepage: "https://ttl.space"
-    description: "E2E Encrypted Ephemeral Storage"
+    description: "Encrypted file transfer. Ephemeral by design, permanent with Orbit."
     license: "MIT"
     commit_msg_template: "update {{ .ProjectName }} to {{ .Tag }}"
     commit_author:

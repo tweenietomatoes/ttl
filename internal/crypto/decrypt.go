@@ -117,16 +117,16 @@ func DecryptStreamWithKey(r io.Reader, key []byte, outDir string) (string, strin
 	}
 
 	// Safe to cast: parseMetadata already checked that chunkSize <= MaxChunkSize
-	buf := make([]byte, int(cs)+TagSize)
+	buf := make([]byte, int(cs)+TagSize) //nolint:gosec // cs <= MaxChunkSize (1 MiB), fits int
 
 	var firstPlain []byte
 	if totalChunks > 0 {
 		// Decrypt the first data chunk in memory (no file created yet)
 		var cipherLen int
 		if fullChunks > 0 {
-			cipherLen = int(chunkSize) + TagSize
+			cipherLen = int(chunkSize) + TagSize //nolint:gosec // chunkSize <= MaxChunkSize
 		} else {
-			cipherLen = int(lastPlainLen) + TagSize
+			cipherLen = int(lastPlainLen) + TagSize //nolint:gosec // lastPlainLen < chunkSize
 		}
 		if _, err = io.ReadFull(r, buf[:cipherLen]); err != nil {
 			return "", "", 0, fmt.Errorf("File truncated at chunk 1")
@@ -154,15 +154,15 @@ func DecryptStreamWithKey(r io.Reader, key []byte, outDir string) (string, strin
 	if err != nil {
 		return "", "", 0, err
 	}
-	out, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	out, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644) //nolint:gosec // outPath is sandboxed by filepath.Rel guard above; user-readable file is intentional
 	if err != nil {
 		return "", "", 0, fmt.Errorf("Cannot create file: %w", err)
 	}
 	var success bool
 	defer func() {
 		if !success {
-			out.Close()
-			os.Remove(outPath)
+			_ = out.Close()
+			_ = os.Remove(outPath)
 		}
 	}()
 
@@ -181,9 +181,9 @@ func DecryptStreamWithKey(r io.Reader, key []byte, outDir string) (string, strin
 		chunkIndex := i + 1
 		var cipherLen int
 		if i < fullChunks {
-			cipherLen = int(chunkSize) + TagSize
+			cipherLen = int(chunkSize) + TagSize //nolint:gosec // chunkSize <= MaxChunkSize
 		} else {
-			cipherLen = int(lastPlainLen) + TagSize
+			cipherLen = int(lastPlainLen) + TagSize //nolint:gosec // lastPlainLen < chunkSize
 		}
 		if _, err = io.ReadFull(r, buf[:cipherLen]); err != nil {
 			return "", "", 0, fmt.Errorf("File truncated at chunk %d", chunkIndex)
@@ -315,7 +315,7 @@ func sanitizeFilename(name string) string {
 	// Remove control characters (C0, DEL, C1) and Unicode format characters (bidi overrides, etc.)
 	var clean strings.Builder
 	for _, r := range name {
-		if r >= 0x20 && !(r >= 0x7f && r <= 0x9f) && !unicode.Is(unicode.Cf, r) {
+		if r >= 0x20 && (r < 0x7f || r > 0x9f) && !unicode.Is(unicode.Cf, r) {
 			clean.WriteRune(r)
 		}
 	}

@@ -140,16 +140,16 @@ func TestResolveOutDir_FileNotDir(t *testing.T) {
 
 func TestResolveOutDir_SymlinkToDir(t *testing.T) {
 	tmp := t.TempDir()
-	real := filepath.Join(tmp, "real")
-	os.Mkdir(real, 0755)
+	target := filepath.Join(tmp, "real")
+	os.Mkdir(target, 0755)
 	link := filepath.Join(tmp, "link")
-	os.Symlink(real, link)
+	os.Symlink(target, link)
 
 	dir, err := resolveOutDir(link)
 	if err != nil {
 		t.Fatalf("symlinked directory should be accepted: %v", err)
 	}
-	realAbs, _ := filepath.Abs(real)
+	realAbs, _ := filepath.Abs(target)
 	if dir != realAbs {
 		t.Fatalf("expected resolved real path %q, got %q", realAbs, dir)
 	}

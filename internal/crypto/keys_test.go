@@ -133,7 +133,7 @@ func TestTokenHash_LowercaseHex(t *testing.T) {
 		t.Fatalf("expected %d hex chars, got %d", TokenHexLen, len(h))
 	}
 	for _, c := range h {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			t.Fatalf("non-lowercase hex char: %c", c)
 		}
 	}

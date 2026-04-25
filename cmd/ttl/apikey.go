@@ -28,7 +28,7 @@ func loadAPIKey() string {
 	// 2. File next to the binary
 	if exe, err := os.Executable(); err == nil {
 		p := filepath.Join(filepath.Dir(exe), keyFileName)
-		if k, err := os.ReadFile(p); err == nil {
+		if k, err := os.ReadFile(p); err == nil { //nolint:gosec // user-config path resolved relative to the user's own binary
 			if s := strings.TrimSpace(string(k)); s != "" {
 				return s
 			}
@@ -38,7 +38,7 @@ func loadAPIKey() string {
 	// 3. ~/.ttl/key
 	if home, err := os.UserHomeDir(); err == nil {
 		p := filepath.Join(home, ".ttl", "key")
-		if k, err := os.ReadFile(p); err == nil {
+		if k, err := os.ReadFile(p); err == nil { //nolint:gosec // user-config path under $HOME
 			if s := strings.TrimSpace(string(k)); s != "" {
 				return s
 			}
@@ -62,11 +62,11 @@ func saveAPIKey(key string) (string, error) {
 		return "", fmt.Errorf("Cannot determine home directory: %w", err)
 	}
 	dir := filepath.Join(home, ".ttl")
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil { //nolint:gosec // 0700 is the right perm for a key dir
 		return "", fmt.Errorf("Cannot create key directory: %w", err)
 	}
 	// Tighten existing dir perms (some dotfile managers create at 0755).
-	_ = os.Chmod(dir, 0700)
+	_ = os.Chmod(dir, 0700) //nolint:gosec // 0700 is the right perm for a key dir
 	p := filepath.Join(dir, "key")
 	if err := writeKeyAtomic(p, key); err != nil {
 		return "", err
@@ -91,17 +91,17 @@ func writeKeyAtomic(dst, key string) error {
 	tmpPath := tmp.Name()
 	cleanup := func() { _ = os.Remove(tmpPath) }
 	if err := tmp.Chmod(0600); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		cleanup()
 		return fmt.Errorf("Cannot set key file perms: %w", err)
 	}
 	if _, err := tmp.WriteString(key + "\n"); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		cleanup()
 		return fmt.Errorf("Cannot write key file: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		cleanup()
 		return fmt.Errorf("Cannot fsync key file: %w", err)
 	}
@@ -125,7 +125,7 @@ func validateKeyFormat(key string) error {
 	}
 	body := key[len(keyPrefix):]
 	for _, c := range body {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') {
 			return fmt.Errorf("Invalid key format (non-alphanumeric character in key body)")
 		}
 	}
@@ -170,11 +170,11 @@ func runActivate(args []string) error {
 	}
 	if sources == 0 {
 		// Interactive prompt; also keeps the key out of argv/history.
-		if !term.IsTerminal(int(os.Stdin.Fd())) {
+		if !term.IsTerminal(int(os.Stdin.Fd())) { //nolint:gosec // stdin fd is 0..2, fits int
 			return fmt.Errorf("No key provided; use --key-stdin or --key-file")
 		}
 		fmt.Fprintf(os.Stderr, "%sEnter Orbit API key:%s ", c(cGray), c(cReset))
-		raw, err := term.ReadPassword(int(os.Stdin.Fd()))
+		raw, err := term.ReadPassword(int(os.Stdin.Fd())) //nolint:gosec // stdin fd is 0..2, fits int
 		fmt.Fprintln(os.Stderr)
 		if err != nil {
 			return fmt.Errorf("Failed to read key")
@@ -196,7 +196,7 @@ func runActivate(args []string) error {
 		return activateWithKey(strings.TrimSpace(line))
 	case keyFile != "":
 		// 4 KiB cap; misconfigured --key-file (/dev/zero, log) shouldn't OOM.
-		f, err := os.Open(keyFile)
+		f, err := os.Open(keyFile) //nolint:gosec // user-supplied --key-file
 		if err != nil {
 			return fmt.Errorf("Cannot read key file: %w", err)
 		}

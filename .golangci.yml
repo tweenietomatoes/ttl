@@ -6,20 +6,32 @@ run:
 linters:
   default: standard
   enable:
-    - errcheck
-    - govet
-    - ineffassign
-    - staticcheck
-    - unused
     - misspell
     - revive
     - gosec
     - bodyclose
     - copyloopvar
-    - prealloc
+  settings:
+    errcheck:
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - fmt.Fprint
+        - os.Remove
+    staticcheck:
+      checks:
+        - all
+        # ST1005 disabled: user-facing CLI error strings are intentionally
+        # capitalized for output consistency ("Error: Cannot read ...").
+        - "-ST1005"
   exclusions:
     rules:
       - path: _test\.go
         linters:
           - errcheck
           - gosec
+          - bodyclose
+          - revive
+          - prealloc

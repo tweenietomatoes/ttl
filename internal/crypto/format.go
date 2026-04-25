@@ -1,3 +1,7 @@
+// Package crypto implements the TTL on-disk format: an authenticated header
+// followed by chunked XChaCha20-Poly1305 ciphertext. It also covers key
+// derivation (Argon2id), metadata sealing, and the bearer-token derivation
+// used by the two-phase download flow.
 package crypto
 
 import (
@@ -6,6 +10,9 @@ import (
 	"unicode/utf8"
 )
 
+// Wire-format constants. Magic identifies a TTL stream; the *Size constants
+// give byte lengths; the *Offset constants give field positions inside the
+// fixed-size header. Bumping any of these is a wire-format break.
 const (
 	Magic        = "TTL\x01"
 	MagicSize    = 4 // len(Magic)
@@ -21,24 +28,26 @@ const (
 	ArgonMemory  = 64 * 1024 // 64 MB of RAM
 	ArgonThreads = 1
 
-	// Metadata encrypted length bounds
+	// MinMetaEncLen / MaxMetaEncLen bound the encrypted metadata block.
 	MinMetaEncLen = 30  // fnLen=1: plain=1+1+8+4=14, cipher=14+16=30
 	MaxMetaEncLen = 268 // fnLen=239: plain=1+239+8+4=252, cipher=252+16=268
 
-	// Maximum chunk size the parser accepts (forward-compat guard).
-	// The encryptor always writes ChunkSize (64 KiB), but the parser
-	// accepts up to 1 MiB so future versions can increase ChunkSize.
+	// MaxChunkSize is the largest chunk the parser will accept (forward-compat
+	// guard). The encryptor always writes ChunkSize (64 KiB), but the parser
+	// tolerates up to 1 MiB so future versions can grow ChunkSize.
 	MaxChunkSize = 1 << 20 // 1 MiB
 
 	// ProbeMaxBytes is the maximum bytes a probe response can contain:
 	// header + max encrypted metadata (no data chunks).
 	ProbeMaxBytes = HeaderSize + MaxMetaEncLen // 314 bytes
 
-	// Download token sizes
+	// DownloadTokenSize is the bearer token length in bytes; TokenHexLen is
+	// its hex-encoded length on the wire.
 	DownloadTokenSize = 32
 	TokenHexLen       = 64 // hex.EncodedLen(DownloadTokenSize)
 
-	// Header layout offsets (each one starts where the previous field ends)
+	// SaltOffset / NonceOffset / MetaLenOffset / HeaderSize describe the
+	// fixed header layout, each starting where the previous field ends.
 	SaltOffset    = MagicSize                   // 4
 	NonceOffset   = SaltOffset + SaltSize       // 20
 	MetaLenOffset = NonceOffset + NonceSize     // 44
@@ -74,16 +83,17 @@ func EncryptedSize(fileSize uint64, filename string) int64 {
 	if fileSize%ChunkSize > 0 {
 		numChunks++
 	}
-	// A zero-byte file has zero chunks
+	// A zero-byte file has zero chunks. fileSize is bounded by MaxFileBytes
+	// (256 MB), so the int64 conversions are guaranteed not to overflow.
 	return int64(HeaderSize) + int64(metaCipherLen) +
-		int64(fileSize) + int64(numChunks)*int64(TagSize)
+		int64(fileSize) + int64(numChunks)*int64(TagSize) //nolint:gosec
 }
 
 func xorNonce(base [NonceSize]byte, index uint64) []byte {
 	n := make([]byte, NonceSize)
 	copy(n, base[:])
 	for i := 0; i < 8; i++ {
-		n[NonceSize-8+i] ^= byte(index >> (i * 8))
+		n[NonceSize-8+i] ^= byte(index >> (i * 8)) //nolint:gosec // shifted+masked byte by definition
 	}
 	return n
 }
@@ -94,7 +104,7 @@ func buildMetadata(filename string, filesize uint64) []byte {
 		fn = fn[:truncatedFilenameLen(filename)]
 	}
 	meta := make([]byte, 1+len(fn)+8+4)
-	meta[0] = byte(len(fn))
+	meta[0] = byte(len(fn)) //nolint:gosec // len(fn) <= MaxFilename (239), fits byte
 	copy(meta[1:], fn)
 	binary.LittleEndian.PutUint64(meta[1+len(fn):], filesize)
 	binary.LittleEndian.PutUint32(meta[1+len(fn)+8:], ChunkSize)

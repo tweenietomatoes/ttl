@@ -100,7 +100,7 @@ func runSend(args []string) error {
 		return fmt.Errorf("File is empty")
 	}
 
-	f, err := os.Open(path)
+	f, err := os.Open(path) //nolint:gosec // path is the user-supplied file argument
 	if err != nil {
 		return err
 	}
@@ -196,7 +196,7 @@ func runSend(args []string) error {
 		}
 	}()
 
-	encSize := crypto.EncryptedSize(uint64(info.Size()), filepath.Base(path))
+	encSize := crypto.EncryptedSize(uint64(info.Size()), filepath.Base(path)) //nolint:gosec // info.Size() is non-negative file size
 	xferTimeout, err := resolveTimeout(timeoutVal, encSize)
 	if err != nil {
 		return err
@@ -214,7 +214,7 @@ func runSend(args []string) error {
 	errCh := make(chan error, 1)
 	go func() {
 		err := crypto.EncryptStream(pw, f,
-			filepath.Base(path), uint64(info.Size()), key, salt)
+			filepath.Base(path), uint64(info.Size()), key, salt) //nolint:gosec // info.Size() is non-negative file size
 		pw.CloseWithError(err)
 		errCh <- err
 	}()
@@ -248,7 +248,7 @@ func runSend(args []string) error {
 		resp, err = doUpload(newH3Client())
 		if err != nil {
 			if resp != nil {
-				resp.Body.Close()
+				_ = resp.Body.Close()
 			}
 			// QUIC failed, fall back to TCP
 			if !jsonMode {
@@ -268,7 +268,7 @@ func runSend(args []string) error {
 			}
 			go func() {
 				err := crypto.EncryptStream(pw, f,
-					filepath.Base(path), uint64(info.Size()), key, salt)
+					filepath.Base(path), uint64(info.Size()), key, salt) //nolint:gosec // info.Size() is non-negative file size
 				pw.CloseWithError(err)
 				errCh <- err
 			}()
@@ -279,7 +279,7 @@ func runSend(args []string) error {
 	}
 	if err != nil {
 		if resp != nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 		}
 		cancel()
 		pw.CloseWithError(err)
@@ -321,7 +321,7 @@ func runSend(args []string) error {
 		if generated {
 			result["password"] = pass
 		}
-		json.NewEncoder(os.Stdout).Encode(result)
+		_ = json.NewEncoder(os.Stdout).Encode(result)
 	} else {
 		fmt.Fprintf(os.Stderr, "%s·✧★◉%s Thank goodness, %s%s%s is in orbit %s(%s%s",
 			c(cGold), c(cReset),
@@ -415,12 +415,12 @@ func resolvePassword(flagValue string, fromStdin bool, fromFile string,
 
 	// From a file (first line only, bounded)
 	if fromFile != "" {
-		f, err := os.Open(fromFile)
+		f, err := os.Open(fromFile) //nolint:gosec // user-supplied --password-file
 		if err != nil {
 			return "", false, fmt.Errorf("Cannot read password file: %w", err)
 		}
 		pass, err := readBoundedFirstLine(f, "password file")
-		f.Close()
+		_ = f.Close()
 		if err != nil {
 			return "", false, err
 		}
@@ -432,12 +432,12 @@ func resolvePassword(flagValue string, fromStdin bool, fromFile string,
 
 	// ttl.password auto-detect (binary-adjacent, then ~/.ttl/password)
 	for _, p := range passwordFilePaths() {
-		f, err := os.Open(p)
+		f, err := os.Open(p) //nolint:gosec // ttl.password lookup uses fixed paths next to binary or under $HOME
 		if err != nil {
 			continue
 		}
 		pass, err := readBoundedFirstLine(f, "ttl.password file")
-		f.Close()
+		_ = f.Close()
 		if err != nil {
 			continue
 		}
@@ -447,7 +447,7 @@ func resolvePassword(flagValue string, fromStdin bool, fromFile string,
 	}
 
 	// No terminal and no password given: cannot prompt
-	if !term.IsTerminal(int(os.Stdin.Fd())) {
+	if !term.IsTerminal(int(os.Stdin.Fd())) { //nolint:gosec // stdin fd is 0..2, fits int
 		return "", false, fmt.Errorf("No password provided; use --password-stdin or --password-file")
 	}
 
@@ -469,7 +469,7 @@ func resolvePassword(flagValue string, fromStdin bool, fromFile string,
 
 	// Prompt the user to type a password
 	fmt.Fprintf(os.Stderr, "%sEnter password:%s ", c(cGray), c(cReset))
-	passBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
+	passBytes, err := term.ReadPassword(int(os.Stdin.Fd())) //nolint:gosec // stdin fd is 0..2, fits int
 	fmt.Fprintln(os.Stderr)
 	if err != nil {
 		return "", false, fmt.Errorf("Failed to read password")
@@ -486,7 +486,7 @@ func resolvePassword(flagValue string, fromStdin bool, fromFile string,
 	}
 	if allowGenerate {
 		fmt.Fprintf(os.Stderr, "%sConfirm password:%s ", c(cGray), c(cReset))
-		confirmBytes, confirmErr := term.ReadPassword(int(os.Stdin.Fd()))
+		confirmBytes, confirmErr := term.ReadPassword(int(os.Stdin.Fd())) //nolint:gosec // stdin fd is 0..2, fits int
 		fmt.Fprintln(os.Stderr)
 		if confirmErr != nil {
 			return "", false, fmt.Errorf("Failed to read password")
@@ -506,9 +506,9 @@ const passwordChars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstu
 
 func generatePassword(length int) (string, error) {
 	result := make([]byte, length)
-	max := big.NewInt(int64(len(passwordChars)))
+	limit := big.NewInt(int64(len(passwordChars)))
 	for i := range result {
-		n, err := rand.Int(rand.Reader, max)
+		n, err := rand.Int(rand.Reader, limit)
 		if err != nil {
 			return "", fmt.Errorf("Random generation failed: %w", err)
 		}
@@ -581,7 +581,7 @@ func handleUploadError(resp *http.Response) error {
 	var p struct {
 		Detail string `json:"detail"`
 	}
-	json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&p)
+	_ = json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&p)
 	switch resp.StatusCode {
 	case 404:
 		return fmt.Errorf("Upload endpoint not found (server may be misconfigured)")

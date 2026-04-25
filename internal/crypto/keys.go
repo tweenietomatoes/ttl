@@ -9,6 +9,8 @@ import (
 	"golang.org/x/crypto/hkdf"
 )
 
+// DeriveEncKey runs Argon2id over (password, salt) and returns the KeySize
+// encryption key used by EncryptStream / DecryptStream.
 func DeriveEncKey(password string, salt []byte) []byte {
 	return argon2.IDKey([]byte(password), salt,
 		ArgonTime, ArgonMemory, ArgonThreads, KeySize)

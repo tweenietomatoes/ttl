@@ -38,7 +38,7 @@ func runPlan(args []string) error {
 	}
 
 	if jsonMode {
-		json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "limits": limits})
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "limits": limits})
 		return nil
 	}
 
@@ -159,7 +159,7 @@ func runList(args []string) error {
 	}
 
 	if jsonMode {
-		json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "files": result.Files})
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "files": result.Files})
 		return nil
 	}
 
@@ -274,12 +274,12 @@ func runDelete(args []string) error {
 		return fmt.Errorf("Request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	_, _ = io.Copy(io.Discard, resp.Body)
 
 	switch resp.StatusCode {
 	case 204:
 		if jsonMode {
-			json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "token": token, "deleted": true})
+			_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "token": token, "deleted": true})
 		} else {
 			fmt.Fprintf(os.Stderr, "%sDeleted:%s %s%s%s\n", c(cGreen), c(cReset), c(cBold), token, c(cReset))
 		}

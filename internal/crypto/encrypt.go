@@ -8,6 +8,9 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
+// EncryptStream writes a TTL stream to w: header, encrypted metadata, then
+// chunked XChaCha20-Poly1305 ciphertext read from file. fileSize must match
+// the byte count read from file or DecryptStream will report a size mismatch.
 func EncryptStream(w io.Writer, file io.Reader, filename string,
 	fileSize uint64, key, salt []byte) error {
 
@@ -37,7 +40,7 @@ func EncryptStream(w io.Writer, file io.Reader, filename string,
 	}
 
 	var metaLen [MetaLenSize]byte
-	binary.BigEndian.PutUint16(metaLen[:], uint16(len(metaCipher)))
+	binary.BigEndian.PutUint16(metaLen[:], uint16(len(metaCipher))) //nolint:gosec // metaCipher <= MaxMetaEncLen (268), fits uint16
 	if _, err := w.Write(metaLen[:]); err != nil {
 		return err
 	}

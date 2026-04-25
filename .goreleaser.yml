@@ -202,6 +202,7 @@ dockers_v2:
       - "ghcr.io/tweenietomatoes/ttl"
     tags:
       - "{{ .Version }}"
+      - "v{{ .Version }}"
       - "latest"
     platforms:
       - linux/amd64

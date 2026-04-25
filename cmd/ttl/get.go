@@ -100,7 +100,7 @@ func runGet(args []string) error {
 		probeResp, err = doProbe(newH3Client())
 		if err != nil {
 			if probeResp != nil {
-				probeResp.Body.Close()
+				_ = probeResp.Body.Close()
 			}
 			if !jsonMode {
 				fmt.Fprintf(os.Stderr, "\n%sH3: Falling back to TCP%s\n", c(cGray), c(cReset))
@@ -115,7 +115,7 @@ func runGet(args []string) error {
 	}
 	if err != nil {
 		if probeResp != nil {
-			probeResp.Body.Close()
+			_ = probeResp.Body.Close()
 		}
 		return fmt.Errorf("Probe failed: %w", err)
 	}
@@ -128,7 +128,7 @@ func runGet(args []string) error {
 
 	// Read probe data into memory (header + metadata, max 314 bytes)
 	probeData, err := io.ReadAll(io.LimitReader(probeResp.Body, int64(crypto.ProbeMaxBytes)+1))
-	probeResp.Body.Close()
+	_ = probeResp.Body.Close()
 	if err != nil {
 		return fmt.Errorf("Probe read failed: %w", err)
 	}
@@ -194,7 +194,7 @@ func runGet(args []string) error {
 		resp, err = doGet(newH3Client())
 		if err != nil {
 			if resp != nil {
-				resp.Body.Close()
+				_ = resp.Body.Close()
 			}
 			if !jsonMode {
 				fmt.Fprintf(os.Stderr, "\n%sH3: Falling back to TCP%s\n", c(cGray), c(cReset))
@@ -209,7 +209,7 @@ func runGet(args []string) error {
 	}
 	if err != nil {
 		if resp != nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 		}
 		return fmt.Errorf("Download failed: %w", err)
 	}
@@ -221,7 +221,8 @@ func runGet(args []string) error {
 
 	encTotal := crypto.EncryptedSize(probeFileSize, probeFilename)
 	origName, filename, written, err := crypto.DecryptStreamWithKey(
-		newProgressReader(resp.Body, encTotal, int64(probeFileSize), jsonMode), encKey, outputDir)
+		newProgressReader(resp.Body, encTotal, int64(probeFileSize), jsonMode), //nolint:gosec // file size <= MaxFileBytes (256 MB), fits int64
+		encKey, outputDir)
 	if err != nil {
 		return err
 	}
@@ -237,7 +238,7 @@ func runGet(args []string) error {
 		if filename != origName {
 			result["original_filename"] = origName
 		}
-		json.NewEncoder(os.Stdout).Encode(result)
+		_ = json.NewEncoder(os.Stdout).Encode(result)
 	} else {
 		if filename != origName {
 			fmt.Fprintf(os.Stderr, "%s⚠ %s already exists — saving as %s%s\n", c(cAmber), origName, filename, c(cReset))
@@ -255,7 +256,7 @@ func isToken(s string) bool {
 		return false
 	}
 	for _, c := range s {
-		if !((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
+		if (c < '0' || c > '9') && (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') {
 			return false
 		}
 	}
@@ -268,11 +269,11 @@ func resolveOutDir(dir string) (string, error) {
 	}
 	// Resolve symlinks so the path traversal check uses the real
 	// filesystem path, not a symlink alias.
-	real, err := filepath.EvalSymlinks(dir)
+	resolved, err := filepath.EvalSymlinks(dir)
 	if err != nil {
 		return "", fmt.Errorf("Output directory does not exist: %s", dir)
 	}
-	abs, err := filepath.Abs(real)
+	abs, err := filepath.Abs(resolved)
 	if err != nil {
 		return "", fmt.Errorf("Invalid output directory: %w", err)
 	}
@@ -288,8 +289,8 @@ func resolveOutDir(dir string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("Output directory not writable: %s", abs)
 	}
-	tmp.Close()
-	os.Remove(tmp.Name())
+	_ = tmp.Close()
+	_ = os.Remove(tmp.Name())
 	return abs, nil
 }
 
@@ -358,7 +359,7 @@ func handleHTTPError(resp *http.Response) error {
 	var p struct {
 		Detail string `json:"detail"`
 	}
-	json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&p)
+	_ = json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&p)
 	switch resp.StatusCode {
 	case 404:
 		return fmt.Errorf("Link not found")

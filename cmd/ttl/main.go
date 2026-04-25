@@ -1,3 +1,5 @@
+// Package main is the ttl CLI: send / get / list / delete files on ttl.space
+// with end-to-end encryption.
 package main
 
 import (
@@ -33,11 +35,12 @@ func main() {
 			args = append(args, a)
 			continue
 		}
-		if a == "-h3" || a == "--h3" || a == "-http3" || a == "--http3" {
+		switch a {
+		case "-h3", "--h3", "-http3", "--http3":
 			forceH3 = true
-		} else if a == "--json" {
+		case "--json":
 			jsonMode = true
-		} else {
+		default:
 			args = append(args, a)
 		}
 	}
@@ -69,14 +72,14 @@ func main() {
 			exitError(err)
 		}
 		if jsonMode {
-			json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "activated": true})
+			_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "activated": true})
 		}
 	case "deactivate":
 		if err := runDeactivate(args[1:]); err != nil {
 			exitError(err)
 		}
 		if jsonMode {
-			json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "deactivated": true})
+			_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "deactivated": true})
 		}
 	case "plan":
 		if err := runPlan(args[1:]); err != nil {
@@ -101,7 +104,7 @@ func main() {
 		}
 	case "version":
 		if jsonMode {
-			json.NewEncoder(os.Stdout).Encode(map[string]any{
+			_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
 				"ok":      true,
 				"version": version,
 			})
@@ -119,7 +122,7 @@ func main() {
 
 func exitHelp() {
 	if jsonMode {
-		json.NewEncoder(os.Stdout).Encode(map[string]any{
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
 			"ok":    false,
 			"error": "Use --help without --json for usage information",
 		})
@@ -130,7 +133,7 @@ func exitHelp() {
 
 func exitError(err error) {
 	if jsonMode {
-		json.NewEncoder(os.Stdout).Encode(map[string]any{
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
 			"ok":    false,
 			"error": err.Error(),
 		})

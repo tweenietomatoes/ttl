@@ -35,7 +35,7 @@ func newProgressReader(r io.Reader, total, displaySize int64, quiet bool) *progr
 		r:       r,
 		total:   total,
 		display: displaySize,
-		tty:     !quiet && term.IsTerminal(int(os.Stderr.Fd())),
+		tty:     !quiet && term.IsTerminal(int(os.Stderr.Fd())), //nolint:gosec // stderr fd is 0..2, fits int
 	}
 }
 
@@ -73,7 +73,7 @@ func (p *progressReader) Read(buf []byte) (int, error) {
 
 // barWidth adapts the bar to the terminal width (min 10, max 60, fallback 20).
 func barWidth() int {
-	w, _, err := term.GetSize(int(os.Stderr.Fd()))
+	w, _, err := term.GetSize(int(os.Stderr.Fd())) //nolint:gosec // stderr fd is 0..2, fits int
 	if err != nil || w < 40 {
 		return 20
 	}

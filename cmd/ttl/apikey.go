@@ -15,6 +15,10 @@ import (
 const keyPrefix = "ttl_orbit_"
 const keyFileName = "ttl.key"
 
+// manageKeyLen is a management key's length: 32 random bytes, base64url
+// without padding (newManageKey on the server).
+const manageKeyLen = 43
+
 // loadAPIKey returns the API key from (in priority order):
 //  1. TTL_API_KEY environment variable
 //  2. ttl.key file next to the binary
@@ -132,6 +136,20 @@ func validateKeyFormat(key string) error {
 	return nil
 }
 
+// validateManageKey checks the shape of a management key (43 base64url
+// characters), the same test the server applies.
+func validateManageKey(key string) error {
+	if len(key) != manageKeyLen {
+		return fmt.Errorf("Invalid management key (expected %d characters, got %d)", manageKeyLen, len(key))
+	}
+	for _, c := range key {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && c != '-' && c != '_' {
+			return fmt.Errorf("Invalid management key (unexpected character)")
+		}
+	}
+	return nil
+}
+
 func setAPIKeyHeader(r interface{ Set(string, string) }, key string) {
 	if key != "" {
 		r.Set("X-API-Key", key)
@@ -144,15 +162,21 @@ func runActivate(args []string) error {
 	fs.BoolVar(&keyStdin, "key-stdin", false, "read the API key from stdin")
 	var keyFile string
 	fs.StringVar(&keyFile, "key-file", "", "read the API key from a file")
+	var serverVal string
+	fs.StringVar(&serverVal, "server", "https://ttl.space", "server URL")
 	fs.Usage = func() {
 		if !jsonMode {
-			fmt.Fprintln(os.Stderr, "Usage: ttl activate [--key-stdin | --key-file F | <key>]")
+			fmt.Fprintln(os.Stderr, "Usage: ttl activate [--key-stdin | --key-file F | <key>] [--server URL]")
 		}
 	}
 	if jsonMode {
 		fs.SetOutput(io.Discard)
 	}
-	if err := fs.Parse(args); err != nil {
+	pos, err := parseArgs(fs, args)
+	if err != nil {
+		return err
+	}
+	if err := validateServerURL(serverVal); err != nil {
 		return err
 	}
 
@@ -165,7 +189,7 @@ func runActivate(args []string) error {
 	if keyFile != "" {
 		sources++
 	}
-	if fs.NArg() > 0 {
+	if len(pos) > 0 {
 		sources++
 	}
 	if sources == 0 {
@@ -179,7 +203,7 @@ func runActivate(args []string) error {
 		if err != nil {
 			return fmt.Errorf("Failed to read key")
 		}
-		return activateWithKey(strings.TrimSpace(string(raw)))
+		return activateWithKey(strings.TrimSpace(string(raw)), serverVal)
 	}
 	if sources > 1 {
 		return fmt.Errorf("Use only one of: --key-stdin, --key-file, or positional <key>")
@@ -193,7 +217,7 @@ func runActivate(args []string) error {
 		if err != nil && err != io.EOF {
 			return fmt.Errorf("Failed to read key from stdin: %w", err)
 		}
-		return activateWithKey(strings.TrimSpace(line))
+		return activateWithKey(strings.TrimSpace(line), serverVal)
 	case keyFile != "":
 		// 4 KiB cap; misconfigured --key-file (/dev/zero, log) shouldn't OOM.
 		f, err := os.Open(keyFile) //nolint:gosec // user-supplied --key-file
@@ -208,9 +232,9 @@ func runActivate(args []string) error {
 		if i := strings.IndexAny(string(raw), "\r\n"); i >= 0 {
 			raw = raw[:i]
 		}
-		return activateWithKey(strings.TrimSpace(string(raw)))
+		return activateWithKey(strings.TrimSpace(string(raw)), serverVal)
 	default:
-		if fs.NArg() != 1 {
+		if len(pos) != 1 {
 			return fmt.Errorf("Usage: ttl activate [--key-stdin | --key-file F | <key>]")
 		}
 		// Positional still works but warn once (silent in JSON mode).
@@ -220,27 +244,66 @@ func runActivate(args []string) error {
 				c(cBold), c(cReset),
 				c(cBold), c(cReset))
 		}
-		return activateWithKey(strings.TrimSpace(fs.Arg(0)))
+		return activateWithKey(strings.TrimSpace(pos[0]), serverVal)
 	}
 }
 
-func activateWithKey(key string) error {
+// activateWithKey checks the key's shape, asks the server whether it is
+// live (a revoked or mistyped key is refused here instead of at the next
+// upload), and stores it. A server that cannot be reached does not block
+// the activation; the key is stored with a warning.
+func activateWithKey(key, server string) error {
 	if err := validateKeyFormat(key); err != nil {
 		return err
+	}
+	plan := ""
+	limits, err := fetchLimits(newConn(), server, key)
+	switch {
+	case err == nil:
+		plan, _ = limits["plan"].(string)
+		plan = stripControl(plan)
+	case isKeyRejected(err):
+		return fmt.Errorf("%w\nThe key was not saved", err)
+	default:
+		if !jsonMode {
+			fmt.Fprintf(os.Stderr, "%sWarning:%s could not verify the key with the server (%v); saving it anyway.\n", c(cAmber, cBold), c(cReset), err)
+		}
 	}
 	path, err := saveAPIKey(key)
 	if err != nil {
 		return err
 	}
 	if jsonMode {
-		return nil // JSON output handled in main
+		writeJSON(struct {
+			OK        bool   `json:"ok"`
+			Activated bool   `json:"activated"`
+			Path      string `json:"path"`
+			Plan      string `json:"plan,omitempty"`
+		}{true, true, path, plan})
+		return nil
 	}
 	fmt.Fprintf(os.Stderr, "%sOrbit plan activated.%s Key saved to %s%s%s\n", c(cGreen), c(cReset), c(cGray), path, c(cReset))
+	if plan != "" && plan != "orbit" {
+		fmt.Fprintf(os.Stderr, "%sNote:%s the server reports plan %q for this key.\n", c(cAmber, cBold), c(cReset), plan)
+	}
 	return nil
 }
 
 func runDeactivate(args []string) error {
-	if len(args) != 0 {
+	fs := flag.NewFlagSet("deactivate", flag.ContinueOnError)
+	fs.Usage = func() {
+		if !jsonMode {
+			fmt.Fprintln(os.Stderr, "Usage: ttl deactivate (no arguments)")
+		}
+	}
+	if jsonMode {
+		fs.SetOutput(io.Discard)
+	}
+	pos, err := parseArgs(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 0 {
 		return fmt.Errorf("Usage: ttl deactivate (no arguments)")
 	}
 
@@ -275,6 +338,14 @@ func runDeactivate(args []string) error {
 	}
 
 	if jsonMode {
+		if removed == nil {
+			removed = []string{}
+		}
+		writeJSON(struct {
+			OK          bool     `json:"ok"`
+			Deactivated bool     `json:"deactivated"`
+			Removed     []string `json:"removed"`
+		}{true, true, removed})
 		return nil
 	}
 	for _, p := range removed {
@@ -282,6 +353,9 @@ func runDeactivate(args []string) error {
 	}
 	if len(removed) == 0 {
 		fmt.Fprintf(os.Stderr, "%sNo key file found.%s\n", c(cGray), c(cReset))
+	}
+	if os.Getenv("TTL_API_KEY") != "" && !jsonMode {
+		fmt.Fprintf(os.Stderr, "%sNote:%s TTL_API_KEY is set in the environment and still applies.\n", c(cAmber, cBold), c(cReset))
 	}
 	return nil
 }

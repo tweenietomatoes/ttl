@@ -47,11 +47,12 @@ Send a file — a password is generated automatically:
 ```
 $ ttl send secret.pdf
 No password provided. Generate one? [Y/n]: y
-Generated password: aB3kL9mX
+Generated password: aB3kL9mXq7Rt
 4.2 MB / 4.2 MB  ·✧★◉✧··✧·✧★◉✧··✧·✧★◉✧··✧·✧★  100%  1.5 MB/s
-·✧★◉ Thank goodness, secret.pdf is in orbit (4.2 MB)
+·✧★◉ Thank goodness, secret.pdf is in orbit (4.2 MB, expires 2026-10-08 12:00)
 IMPORTANT! Save your password — required to download and decrypt the file.
-Password: aB3kL9mX
+Password: aB3kL9mXq7Rt
+Manage key: k7Qm2vXpL9aR4tB8cD1eF6gH3jK5mN0oP2qS4uV7wYz (ttl status / ttl delete -k)
 https://ttl.space/aBcDeFgHiJ
 ```
 
@@ -77,7 +78,7 @@ Files can self-destruct after the first download. Once retrieved, the server del
 
 ```
 $ ttl send -b confidential.pdf
-·✧★◉ Thank goodness, confidential.pdf is in orbit (912.0 KB, self-destructs after download)
+·✧★◉ Thank goodness, confidential.pdf is in orbit (912.0 KB, expires 2026-10-08 12:00, self-destructs after download)
 ```
 
 ```
@@ -87,10 +88,37 @@ Password verified
 ◉★✧· Phew, confidential.pdf landed safe and sound (912.0 KB)
 
 $ ttl get aBcDeFgHiJ
-Error: Link not found
+Error: Link not found. The file may have expired, been downloaded already (burn after reading), or be private (uploader-only)
 ```
 
 A second attempt returns an error — the file no longer exists.
+
+## 🗝️ Manage key: status and early delete
+
+Every upload comes with a **management key**, printed once by `ttl send` (`manage_key` in `--json`). The server keeps only its hash. It works on any plan and lets you follow the upload or end it early — without an Orbit key. Anyone holding the key can delete the upload, so keep it like the password.
+
+```
+$ ttl status aBcDeFgHiJ -k k7Qm2vXpL9aR4tB8cD1eF6gH3jK5mN0oP2qS4uV7wYz
+Token:      aBcDeFgHiJ
+State:      active
+Size:       4.2 MB
+Created:    2026-10-01 12:00
+Expires:    2026-10-08 12:00
+Downloads:  1 (last 2026-10-02 09:12)
+
+$ ttl delete aBcDeFgHiJ -k k7Qm2vXpL9aR4tB8cD1eF6gH3jK5mN0oP2qS4uV7wYz
+Deleted: aBcDeFgHiJ
+```
+
+The state is one of `active`, `expired`, `burned` or `deleted`. Files opened in parts on the recipient page (a package's file list) show up as "Opened on page", never as downloads.
+
+## 🔁 Resumable transfers
+
+A dropped connection does not restart a transfer:
+
+- **Uploads** above 16 MiB go through the server's resumable upload API: the encrypted stream is sent in 16 MiB parts, each with a SHA-256 `Content-Digest`. A part that fails — a lost connection, a 5xx, bytes altered on the way — is sent again from memory; the rest of the file is untouched. Smaller files go in one request and are sent again in full if the connection breaks. The CLI gives up after 15 minutes without progress.
+- **Downloads** resume with a byte-range request from the last byte received; every 64 KiB chunk is authenticated on its own, so a resumed stream decrypts exactly like an unbroken one. Burn-after-reading files cannot be resumed — the server refuses ranges for them, so the first transfer must complete.
+- **Ctrl-C** cancels cleanly: an open upload session is handed back to the server, and a partial download is removed.
 
 ## 🪐 Orbit plan
 
@@ -104,8 +132,10 @@ The Orbit key is auto-detected (first match wins):
 
 When `ttl get` runs with a key configured, it is sent automatically so private (uploader-only) files open transparently.
 
+`ttl activate` checks the key against the server before saving it, so a mistyped or revoked key is refused on the spot. Prefer `--key-stdin` or `--key-file` over the positional form, which lands in shell history.
+
 ```
-$ ttl activate ttl_orbit_aBcDeFgHiJ...
+$ ttl activate --key-file ~/orbit.key
 Orbit plan activated. Key saved to /usr/local/bin/ttl.key
 
 $ ttl plan
@@ -113,6 +143,7 @@ Plan: orbit
 Max file size: 10.0 GB
 Max TTL: 30 days (or permanent)
 Uploads per day: 1000000
+Storage quota: 500.0 GB
 
 Usage:
   Uploads today: 3
@@ -136,16 +167,18 @@ $ ttl deactivate
 Key file removed: /usr/local/bin/ttl.key
 ```
 
+`ttl list` walks every page the server returns (20 files per page); `-n N` stops after N files. `ttl delete` with an Orbit key deletes any file the key uploaded; with `-k` it deletes by management key instead.
+
 ### 🔐 Uploader-only (private) files
 
 Add `-u` / `--uploader-only` (or `--private`) on send to require the uploader's API key on download. Even with the link and the password, anyone without the key gets a 404 (probe) or 403 (download) — indistinguishable from a wrong-password response.
 
 ```
 $ ttl send -u -t 1d board-minutes.pdf
-·✧★◉ Thank goodness, board-minutes.pdf is in orbit (240.0 KB, private — uploader's API key required to download)
+·✧★◉ Thank goodness, board-minutes.pdf is in orbit (240.0 KB, expires 2026-10-02 12:00, private — uploader's API key required to download)
 
 $ TTL_API_KEY="" ttl get aBcDeFgHiJ
-Error: Link not found
+Error: Link not found. The file may have expired, been downloaded already (burn after reading), or be private (uploader-only)
 
 $ ttl get aBcDeFgHiJ          # API key auto-loaded — opens fine
 Password verified
@@ -168,11 +201,12 @@ Both flags compose: `ttl send -u -t permanent ...`.
 ```
 ttl send [-p P] [-t DUR] [-b] [-u] [--json] [--timeout D] FILE
 ttl get  [-p P] [--json] [--timeout D] [-o DIR] URL or TOKEN
-ttl activate <key>
+ttl status <token> -k KEY
+ttl delete <token> [-k KEY]
+ttl activate [--key-stdin | --key-file F | <key>]
 ttl deactivate
 ttl plan
-ttl list
-ttl delete <token>
+ttl list [-n N]
 ttl version
 ```
 
@@ -183,6 +217,9 @@ ttl version
 | `-b, --burn` | Burn after reading — deleted after first download |
 | `-u, --uploader-only` | Private file (Orbit) — only the uploader's API key can download. Aliases: `--private` |
 | `-o, --output DIR` | Output directory (default: current directory) |
+| `-k, --manage-key KEY` | Management key printed by `ttl send` — status or early delete on any plan |
+| `-n, --limit N` | `ttl list`: stop after N files (default: all) |
+| `--server URL` | Server to talk to (default: `https://ttl.space`) |
 | `--timeout D` | Transfer timeout (e.g. `5m`, `1h`). Default: auto (assumes 1 Mbps) |
 | `--password-stdin` | Read password from stdin |
 | `--password-file F` | Read password from file |
@@ -259,7 +296,7 @@ Password is resolved in this order (first match wins):
 | 3 | `--password-file` | `ttl send --password-file /run/secrets/pw file.txt` |
 | 4 | `ttl.password` file | Auto-detected from next to binary or `~/.ttl/password` |
 | 5 | Interactive prompt | Prompted securely with hidden input (terminal only) |
-| 6 | Auto-generate | If none of the above, generates an 8-character random password (send only) |
+| 6 | Auto-generate | If none of the above, generates a 12-character random password (send only) |
 
 Minimum password length is 8 characters. Only one explicit source (`-p`, `--password-stdin`, `--password-file`) can be used at a time. For scripts, prefer `--password-stdin` or `--password-file` over `-p`.
 
@@ -269,13 +306,16 @@ Minimum password length is 8 characters. Only one explicit source (`-p`, `--pass
 
 ```
 $ ttl --json send report.pdf
-{"ok":true,"link":"https://ttl.space/xK9mQ2vLpA","filename":"report.pdf","size":2097152,"ttl":"7d","burn":false,"uploader_only":false,"is_permanent":false,"password":"aB3kL9mX"}
+{"ok":true,"link":"https://ttl.space/xK9mQ2vLpA","token":"xK9mQ2vLpA","filename":"report.pdf","size":2097152,"ttl":"7d","expires_in":604800,"expires_at":1760011200,"burn":false,"uploader_only":false,"is_permanent":false,"manage_key":"k7Qm2vXpL9aR4tB8cD1eF6gH3jK5mN0oP2qS4uV7wYz","password":"aB3kL9mXq7Rt"}
 
-$ ttl --json get -p aB3kL9mX xK9mQ2vLpA
-{"ok":true,"filename":"report.pdf","size":2097152,"saved_to":"/home/user/report.pdf"}
+$ ttl --json get -p aB3kL9mXq7Rt xK9mQ2vLpA
+{"ok":true,"token":"xK9mQ2vLpA","filename":"report.pdf","size":2097152,"saved_to":"/home/user/report.pdf"}
 
-$ ttl --json get -p aB3kL9mX nonExistent
-{"ok":false,"error":"Link not found"}
+$ ttl --json status xK9mQ2vLpA -k k7Qm2vXpL9aR4tB8cD1eF6gH3jK5mN0oP2qS4uV7wYz
+{"ok":true,"token":"xK9mQ2vLpA","status":{"state":"active","size_bytes":2097152,"created_at":1759406400,"expires_at":1760011200,"permanent":false,"burn":false,"note":false,"uploader_only":false,"downloads":1,"last_download_at":1759492800,"part_reads":0,"last_part_at":0}}
+
+$ ttl --json get -p aB3kL9mXq7Rt nonExistent
+{"ok":false,"error":"Link not found. The file may have expired, been downloaded already (burn after reading), or be private (uploader-only)"}
 ```
 
 | Behavior | Detail |
@@ -337,8 +377,10 @@ Limits are fetched from the server at upload time and depend on your plan.
 | Max file size | 2 GB | 10 GB |
 | Max retention | 7 days | 30 days, or permanent |
 | Uploads per day | 10 | effectively unlimited |
+| Upload volume per day (per IP) | 10 GB | unlimited |
 | Storage quota | — | 500 GB (expandable) |
-| Delete & list | — | ✓ |
+| Delete | with the manage key | ✓ |
+| List | — | ✓ |
 | Uploader-only (private) | — | ✓ |
 | Min password | 8 characters | 8 characters |
 | Requests per IP | 30 per 10 seconds | 30 per 10 seconds |

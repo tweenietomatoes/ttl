@@ -46,13 +46,13 @@ func TestEncryptedSize_64KBPlus1(t *testing.T) {
 	}
 }
 
-func TestEncryptedSize_256MB(t *testing.T) {
+func TestEncryptedSize_MaxFileBytes(t *testing.T) {
 	fn := "test.txt"
 	got := EncryptedSize(MaxFileBytes, fn)
 	numChunks := int64(MaxFileBytes) / int64(ChunkSize)
 	expected := int64(HeaderSize) + metaCipherLen(len(fn)) + int64(MaxFileBytes) + numChunks*int64(TagSize)
 	if got != expected {
-		t.Fatalf("256MB: expected %d, got %d", expected, got)
+		t.Fatalf("MaxFileBytes: expected %d, got %d", expected, got)
 	}
 }
 

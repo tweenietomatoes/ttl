@@ -4,14 +4,18 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/tweenietomatoes/ttl/internal/crypto"
@@ -36,6 +40,9 @@ func runGet(args []string) error {
 	var outDirVal string
 	fs.StringVar(&outDirVal, "o", "", "output directory")
 	fs.StringVar(&outDirVal, "output", "", "output directory")
+
+	var serverVal string
+	fs.StringVar(&serverVal, "server", "https://ttl.space", "server URL for a bare token")
 	fs.Usage = func() {
 		if !jsonMode {
 			printUsage()
@@ -44,11 +51,11 @@ func runGet(args []string) error {
 	if jsonMode {
 		fs.SetOutput(io.Discard)
 	}
-	if err := fs.Parse(args); err != nil {
+	pos, err := parseArgs(fs, args)
+	if err != nil {
 		return err
 	}
-
-	if fs.NArg() != 1 {
+	if len(pos) != 1 {
 		return fmt.Errorf("Usage: ttl get [-p PASS] [-o DIR] URL or TOKEN")
 	}
 
@@ -58,10 +65,13 @@ func runGet(args []string) error {
 		return err
 	}
 
-	rawURL := fs.Arg(0)
+	rawURL := pos[0]
 	// Allow bare token (10 alphanumeric chars) as shorthand for https://ttl.space/TOKEN
 	if isToken(rawURL) {
-		rawURL = "https://ttl.space/" + rawURL
+		if err := validateServerURL(serverVal); err != nil {
+			return err
+		}
+		rawURL = strings.TrimRight(serverVal, "/") + "/" + rawURL
 	}
 	token, baseURL, err := parseURL(rawURL)
 	if err != nil {
@@ -73,6 +83,10 @@ func runGet(args []string) error {
 		return err
 	}
 
+	// Sent on probe + download; needed for uploader-only files, harmless otherwise.
+	apiKey := loadAPIKey()
+	hc := newConn()
+
 	// --- probe: fetch header + metadata, verify password ---
 	const probeTimeout = 30 * time.Second
 	probeCtx, probeCancel := context.WithTimeout(context.Background(), probeTimeout)
@@ -82,41 +96,13 @@ func runGet(args []string) error {
 	if err != nil {
 		return fmt.Errorf("Invalid URL: %w", err)
 	}
-
-	// Sent on probe + download; needed for uploader-only files, harmless otherwise.
-	apiKey := loadAPIKey()
-
-	doProbe := func(client *http.Client) (*http.Response, error) {
-		req, reqErr := http.NewRequestWithContext(probeCtx, "GET", probeURL, nil)
-		if reqErr != nil {
-			return nil, fmt.Errorf("Invalid URL: %w", reqErr)
-		}
-		setAPIKeyHeader(req.Header, apiKey)
-		return client.Do(req)
-	}
-
-	var probeResp *http.Response
-	if forceH3 {
-		probeResp, err = doProbe(newH3Client())
-		if err != nil {
-			if probeResp != nil {
-				_ = probeResp.Body.Close()
-			}
-			if !jsonMode {
-				fmt.Fprintf(os.Stderr, "\n%sH3: Falling back to TCP%s\n", c(cGray), c(cReset))
-			}
-			probeCancel()
-			probeCtx, probeCancel = context.WithTimeout(context.Background(), probeTimeout)
-			defer probeCancel()
-			probeResp, err = doProbe(newTCPClient(probeTimeout))
-		}
-	} else {
-		probeResp, err = doProbe(newTCPClient(probeTimeout))
-	}
+	probeReq, err := newRequest(probeCtx, http.MethodGet, probeURL, nil)
 	if err != nil {
-		if probeResp != nil {
-			_ = probeResp.Body.Close()
-		}
+		return err
+	}
+	setAPIKeyHeader(probeReq.Header, apiKey)
+	probeResp, err := hc.do(probeReq)
+	if err != nil {
 		return fmt.Errorf("Probe failed: %w", err)
 	}
 
@@ -167,78 +153,70 @@ func runGet(args []string) error {
 	tokenHex := hex.EncodeToString(downloadToken)
 
 	// --- download: full file, authenticated with bearer token ---
-	xferTimeout, err := resolveTimeout(timeoutVal, crypto.EncryptedSize(probeFileSize, probeFilename))
+	encTotal := crypto.EncryptedSize(probeFileSize, probeFilename)
+	xferTimeout, err := resolveTimeout(timeoutVal, encTotal)
 	if err != nil {
 		return err
 	}
 	dlCtx, dlCancel := context.WithTimeout(context.Background(), xferTimeout)
 	defer dlCancel()
+	// Ctrl-C ends the download cleanly: the partial file is removed.
+	dlCtx, stop := signal.NotifyContext(dlCtx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	downloadURL, err := url.JoinPath(baseURL, token)
 	if err != nil {
 		return fmt.Errorf("Invalid URL: %w", err)
 	}
-	doGet := func(client *http.Client) (*http.Response, error) {
-		req, reqErr := http.NewRequestWithContext(dlCtx, "GET", downloadURL, nil)
+	open := func(ctx context.Context, from int64) (*http.Response, error) {
+		req, reqErr := newRequest(ctx, http.MethodGet, downloadURL, nil)
 		if reqErr != nil {
-			return nil, fmt.Errorf("Invalid URL: %w", reqErr)
+			return nil, reqErr
 		}
 		req.Header.Set("X-Download-Token", tokenHex)
 		req.Header.Set("X-Confirm-Burn", "true")
 		setAPIKeyHeader(req.Header, apiKey)
-		return client.Do(req)
+		if from > 0 {
+			req.Header.Set("Range", "bytes="+strconv.FormatInt(from, 10)+"-")
+		}
+		return hc.do(req)
 	}
 
-	var resp *http.Response
-	if forceH3 {
-		resp, err = doGet(newH3Client())
-		if err != nil {
-			if resp != nil {
-				_ = resp.Body.Close()
-			}
-			if !jsonMode {
-				fmt.Fprintf(os.Stderr, "\n%sH3: Falling back to TCP%s\n", c(cGray), c(cReset))
-			}
-			dlCancel()
-			dlCtx, dlCancel = context.WithTimeout(context.Background(), xferTimeout)
-			defer dlCancel()
-			resp, err = doGet(newTCPClient(xferTimeout))
-		}
-	} else {
-		resp, err = doGet(newTCPClient(xferTimeout))
-	}
+	resp, err := open(dlCtx, 0)
 	if err != nil {
-		if resp != nil {
-			_ = resp.Body.Close()
-		}
 		return fmt.Errorf("Download failed: %w", err)
 	}
-	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
+		defer resp.Body.Close()
 		return handleHTTPError(resp)
 	}
 
-	encTotal := crypto.EncryptedSize(probeFileSize, probeFilename)
-	origName, filename, written, err := crypto.DecryptStreamWithKey(
-		newProgressReader(resp.Body, encTotal, int64(probeFileSize), jsonMode), //nolint:gosec // file size <= MaxFileBytes (256 MB), fits int64
-		encKey, outputDir)
+	prog := newProgress(encTotal, int64(probeFileSize), jsonMode) //nolint:gosec // file size is capped at 1 TB by parseMetadata, fits int64
+	body := &resumingBody{ctx: dlCtx, open: open, body: resp.Body, total: encTotal, prog: prog}
+	defer func() { _ = body.Close() }()
+	origName, filename, written, err := crypto.DecryptStreamWithKey(prog.reader(body), encKey, outputDir)
+	prog.finish()
 	if err != nil {
+		if body.failure != nil {
+			return body.failure
+		}
 		return err
 	}
 
 	if jsonMode {
 		savedTo, _ := filepath.Abs(filepath.Join(outputDir, filename))
-		result := map[string]any{
-			"ok":       true,
-			"filename": filename,
-			"size":     written,
-			"saved_to": savedTo,
-		}
+		out := struct {
+			OK               bool   `json:"ok"`
+			Token            string `json:"token"`
+			Filename         string `json:"filename"`
+			Size             int64  `json:"size"`
+			SavedTo          string `json:"saved_to"`
+			OriginalFilename string `json:"original_filename,omitempty"`
+		}{true, token, filename, written, savedTo, ""}
 		if filename != origName {
-			result["original_filename"] = origName
+			out.OriginalFilename = origName
 		}
-		_ = json.NewEncoder(os.Stdout).Encode(result)
+		writeJSON(out)
 	} else {
 		if filename != origName {
 			fmt.Fprintf(os.Stderr, "%s⚠ %s already exists — saving as %s%s\n", c(cAmber), origName, filename, c(cReset))
@@ -250,6 +228,130 @@ func runGet(args []string) error {
 	}
 	return nil
 }
+
+// ── Resumable download ──
+
+const maxResumes = 8
+
+// resumingBody reads a download and, when the connection breaks before
+// all total bytes arrived, asks the server for the rest with a Range
+// request and carries on where it stopped. Every 64 KiB chunk is its own
+// authenticated block, so the decryptor sees one continuous stream. A
+// server that ignores Range (200) has the bytes already received skipped.
+// One-time files cannot be resumed: the server refuses ranges for them.
+type resumingBody struct {
+	ctx     context.Context
+	open    func(ctx context.Context, from int64) (*http.Response, error)
+	body    io.ReadCloser
+	off     int64 // bytes delivered so far
+	total   int64 // bytes expected on the wire
+	tries   int
+	broken  error // a body error still to be handled on the next Read
+	failure error // why resuming was given up
+	prog    *progress
+}
+
+func (b *resumingBody) Read(p []byte) (int, error) {
+	if b.broken != nil {
+		cause := b.broken
+		b.broken = nil
+		if err := b.resume(cause); err != nil {
+			return 0, err
+		}
+	}
+	for {
+		n, err := b.body.Read(p)
+		b.off += int64(n)
+		if err == nil || (errors.Is(err, io.EOF) && b.off >= b.total) {
+			return n, err
+		}
+		// The body ended early: a broken connection, or a clean end short
+		// of the size. Hand over what arrived first; resume on the next call.
+		if n > 0 {
+			b.broken = err
+			return n, nil
+		}
+		if rErr := b.resume(err); rErr != nil {
+			return 0, rErr
+		}
+	}
+}
+
+// resume reopens the download from b.off. It gives up after maxResumes
+// attempts, when the transfer's deadline passed, or when the server
+// refuses (a one-time file, a link gone in the meantime).
+func (b *resumingBody) resume(cause error) error {
+	_ = b.body.Close()
+	fail := func(err error) error {
+		b.failure = err
+		return err
+	}
+	for {
+		if b.ctx.Err() != nil {
+			return fail(ctxError(b.ctx, "Download"))
+		}
+		if b.tries >= maxResumes {
+			return fail(fmt.Errorf("Download failed after %d resume attempts: %v", b.tries, cause))
+		}
+		b.tries++
+		wait := jittered(min(retryBase<<(b.tries-1), maxRetryPause))
+		b.prog.note(fmt.Sprintf("Connection lost at %s (%v), resuming in %s", humanBytes(b.off), cause, wait.Round(time.Millisecond)))
+		if sleepCtx(b.ctx, wait) != nil {
+			return fail(ctxError(b.ctx, "Download"))
+		}
+		resp, err := b.open(b.ctx, b.off)
+		if err != nil {
+			cause = err
+			continue
+		}
+		switch resp.StatusCode {
+		case http.StatusPartialContent:
+			start, ok := contentRangeStart(resp.Header.Get("Content-Range"))
+			if !ok || start != b.off {
+				_ = resp.Body.Close()
+				return fail(fmt.Errorf("Download failed: server answered with an unexpected byte range"))
+			}
+			b.body = resp.Body
+			return nil
+		case http.StatusOK:
+			// Range not honoured: skip what is already on disk.
+			if _, err := io.CopyN(io.Discard, resp.Body, b.off); err != nil {
+				_ = resp.Body.Close()
+				cause = err
+				continue
+			}
+			b.body = resp.Body
+			return nil
+		default:
+			err := handleHTTPError(resp)
+			_ = resp.Body.Close()
+			return fail(err)
+		}
+	}
+}
+
+func (b *resumingBody) Close() error {
+	return b.body.Close()
+}
+
+// contentRangeStart reads the first byte position out of "bytes a-b/n".
+func contentRangeStart(h string) (int64, bool) {
+	spec, ok := strings.CutPrefix(strings.TrimSpace(h), "bytes ")
+	if !ok {
+		return 0, false
+	}
+	a, _, ok := strings.Cut(spec, "-")
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(a), 10, 64)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// ── Helpers ──
 
 func isToken(s string) bool {
 	if len(s) != 10 {
@@ -355,19 +457,49 @@ func validateServerURL(raw string) error {
 	return requireSecureScheme(u)
 }
 
-func handleHTTPError(resp *http.Response) error {
+// readDetail returns the server's problem+json "detail", control
+// characters stripped, or "" when the body carries none. Reads at most
+// 4 KiB; the caller closes the body.
+func readDetail(resp *http.Response) string {
 	var p struct {
 		Detail string `json:"detail"`
 	}
 	_ = json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&p)
+	return stripControl(p.Detail)
+}
+
+// handleHTTPError words a refused probe or download. The server answers
+// every missing, expired, burned or locked link with the same 404 and a
+// wrong token with the same 403 as a locked file, so the messages name
+// all the possibilities rather than guess.
+func handleHTTPError(resp *http.Response) error {
+	detail := readDetail(resp)
 	switch resp.StatusCode {
-	case 404:
-		return fmt.Errorf("Link not found")
-	case 429:
-		return fmt.Errorf("Rate limit exceeded — max 30 requests per 10s\nTry again later or see: https://ttl.space/usage")
+	case http.StatusUnauthorized:
+		return fmt.Errorf("Invalid or expired API key\nRun: ttl activate <key> with a valid key, or ttl deactivate to use the free plan")
+	case http.StatusForbidden:
+		if detail == "" {
+			detail = "Invalid download token"
+		}
+		return fmt.Errorf("Download refused: %s\nIf this is a private (uploader-only) file, the uploader's Orbit key must be active: ttl activate <key>", detail)
+	case http.StatusNotFound:
+		return fmt.Errorf("Link not found. The file may have expired, been downloaded already (burn after reading), or be private (uploader-only)")
+	case http.StatusRequestTimeout:
+		return fmt.Errorf("Server timed out waiting for the client; try again")
+	case http.StatusTooManyRequests:
+		msg := "Rate limit exceeded — max 30 requests per 10s"
+		if detail != "" {
+			msg = detail
+		}
+		if ra := retryAfterSeconds(resp.Header.Get("Retry-After")); ra > 0 {
+			msg += fmt.Sprintf(" (retry after %ds)", ra)
+		}
+		return fmt.Errorf("%s\nTry again later or see: https://ttl.space/usage", msg)
+	case http.StatusBadGateway, http.StatusServiceUnavailable:
+		return fmt.Errorf("Storage temporarily unavailable, try again later")
 	default:
-		if p.Detail != "" {
-			return fmt.Errorf("Server error: %s", stripControl(p.Detail))
+		if detail != "" {
+			return fmt.Errorf("Server error: %s", detail)
 		}
 		return fmt.Errorf("Server error: %d", resp.StatusCode)
 	}

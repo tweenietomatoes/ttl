@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -11,6 +13,8 @@ import (
 	"strings"
 	"time"
 )
+
+const apiTimeout = 30 * time.Second
 
 func runPlan(args []string) error {
 	fs := flag.NewFlagSet("plan", flag.ContinueOnError)
@@ -24,21 +28,28 @@ func runPlan(args []string) error {
 	if jsonMode {
 		fs.SetOutput(io.Discard)
 	}
-	if err := fs.Parse(args); err != nil {
+	pos, err := parseArgs(fs, args)
+	if err != nil {
 		return err
+	}
+	if len(pos) != 0 {
+		return fmt.Errorf("Usage: ttl plan [--server URL]")
 	}
 
 	if err := validateServerURL(serverVal); err != nil {
 		return err
 	}
 	apiKey := loadAPIKey()
-	limits, err := fetchLimits(serverVal, apiKey)
+	limits, err := fetchLimits(newConn(), serverVal, apiKey)
 	if err != nil {
 		return err
 	}
 
 	if jsonMode {
-		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "limits": limits})
+		writeJSON(struct {
+			OK     bool           `json:"ok"`
+			Limits map[string]any `json:"limits"`
+		}{true, limits})
 		return nil
 	}
 
@@ -56,14 +67,44 @@ func runPlan(args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "%sMax TTL:%s %s\n", c(cGray), c(cReset), maxTTL)
 	fmt.Fprintf(os.Stderr, "%sUploads per day:%s %d\n", c(cGray), c(cReset), int(jsonInt64(limits["uploads_per_day"])))
+	dailyQuota := jsonInt64(limits["daily_bytes_quota"])
+	if dailyQuota > 0 {
+		fmt.Fprintf(os.Stderr, "%sUpload volume per day:%s %s\n", c(cGray), c(cReset), humanBytes(dailyQuota))
+	}
+	storageQuota := jsonInt64(limits["storage_quota_bytes"])
+	if storageQuota > 0 {
+		fmt.Fprintf(os.Stderr, "%sStorage quota:%s %s", c(cGray), c(cReset), humanBytes(storageQuota))
+		if addons := jsonInt64(limits["storage_addons"]); addons > 0 {
+			fmt.Fprintf(os.Stderr, " %s(%d add-on)%s", c(cGray), addons, c(cReset))
+		}
+		fmt.Fprintln(os.Stderr)
+	}
 
 	if usage, ok := limits["usage"].(map[string]any); ok {
 		fmt.Fprintf(os.Stderr, "\n%sUsage:%s\n", c(cBold), c(cReset))
 		fmt.Fprintf(os.Stderr, "  %sUploads today:%s %d\n", c(cGray), c(cReset), int(jsonInt64(usage["uploads_today"])))
-		fmt.Fprintf(os.Stderr, "  %sActive storage:%s %s / %s\n",
-			c(cGray), c(cReset),
-			humanBytes(jsonInt64(usage["active_storage_bytes"])),
-			humanBytes(jsonInt64(limits["storage_quota_bytes"])))
+		if storageQuota > 0 {
+			fmt.Fprintf(os.Stderr, "  %sActive storage:%s %s / %s\n",
+				c(cGray), c(cReset),
+				humanBytes(jsonInt64(usage["active_storage_bytes"])),
+				humanBytes(storageQuota))
+		}
+		if _, has := usage["daily_bytes_used"]; has && dailyQuota > 0 {
+			fmt.Fprintf(os.Stderr, "  %sUpload volume today:%s %s / %s %s(%s remaining)%s\n",
+				c(cGray), c(cReset),
+				humanBytes(jsonInt64(usage["daily_bytes_used"])), humanBytes(dailyQuota),
+				c(cGray), humanBytes(jsonInt64(usage["daily_bytes_remaining"])), c(cReset))
+		}
+	}
+
+	// A cancellation on its way: access lasts until the paid period ends.
+	if at := jsonInt64(limits["cancel_scheduled_at"]); at > 0 {
+		fmt.Fprintf(os.Stderr, "\n%s%sCancellation scheduled.%s", c(cAmber), c(cBold), c(cReset))
+		if until := jsonInt64(limits["access_until"]); until > 0 {
+			fmt.Fprintf(os.Stderr, " Orbit stays active until %s%s%s.",
+				c(cBold), time.UnixMicro(until).Format("2006-01-02 15:04 MST"), c(cReset))
+		}
+		fmt.Fprintln(os.Stderr)
 	}
 
 	// Red banner when subscription ended; permanent files are queued for
@@ -88,20 +129,48 @@ func runPlan(args []string) error {
 	return nil
 }
 
+// listedFile is one entry of GET /v1/files.
+type listedFile struct {
+	Token          string `json:"token"`
+	Link           string `json:"link"`
+	SizeBytes      int64  `json:"size_bytes"`
+	CreatedAt      int64  `json:"created_at"`
+	ExpiresAt      int64  `json:"expires_at"`
+	Burn           bool   `json:"burn"`
+	Expired        bool   `json:"expired"`
+	UploaderOnly   bool   `json:"uploader_only"`
+	IsPermanent    bool   `json:"is_permanent"`
+	IsNote         bool   `json:"is_note"`
+	PermGraceUntil int64  `json:"perm_grace_until"`
+}
+
+// maxListPages bounds the walk over next_cursor (20 files per page).
+const maxListPages = 250
+
 func runList(args []string) error {
 	fs := flag.NewFlagSet("list", flag.ContinueOnError)
 	var serverVal string
 	fs.StringVar(&serverVal, "server", "https://ttl.space", "server URL")
+	var limitVal int
+	fs.IntVar(&limitVal, "n", 0, "stop after N files (0 = all)")
+	fs.IntVar(&limitVal, "limit", 0, "stop after N files (0 = all)")
 	fs.Usage = func() {
 		if !jsonMode {
-			fmt.Fprintln(os.Stderr, "Usage: ttl list [--server URL]")
+			fmt.Fprintln(os.Stderr, "Usage: ttl list [-n N] [--server URL]")
 		}
 	}
 	if jsonMode {
 		fs.SetOutput(io.Discard)
 	}
-	if err := fs.Parse(args); err != nil {
+	pos, err := parseArgs(fs, args)
+	if err != nil {
 		return err
+	}
+	if len(pos) != 0 {
+		return fmt.Errorf("Usage: ttl list [-n N] [--server URL]")
+	}
+	if limitVal < 0 {
+		return fmt.Errorf("Invalid -n: %d", limitVal)
 	}
 
 	if err := validateServerURL(serverVal); err != nil {
@@ -117,58 +186,59 @@ func runList(args []string) error {
 		return fmt.Errorf("Invalid server URL: %w", err)
 	}
 
-	client := newTCPClient(30 * time.Second)
-	req, err := http.NewRequest("GET", listURL, nil)
-	if err != nil {
-		return err
-	}
-	setAPIKeyHeader(req.Header, apiKey)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("Request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 401 {
-		return fmt.Errorf("Invalid or expired API key")
-	}
-	if resp.StatusCode == 403 {
-		return fmt.Errorf("File listing requires an Orbit plan")
-	}
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("Server returned %d", resp.StatusCode)
-	}
-
-	var result struct {
-		Files []struct {
-			Token          string `json:"token"`
-			Link           string `json:"link"`
-			SizeBytes      int64  `json:"size_bytes"`
-			CreatedAt      int64  `json:"created_at"`
-			ExpiresAt      int64  `json:"expires_at"`
-			Burn           bool   `json:"burn"`
-			Expired        bool   `json:"expired"`
-			UploaderOnly   bool   `json:"uploader_only"`
-			IsPermanent    bool   `json:"is_permanent"`
-			PermGraceUntil int64  `json:"perm_grace_until"`
-		} `json:"files"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&result); err != nil {
-		return fmt.Errorf("Invalid server response: %w", err)
+	// The server answers 20 files per page, newest first, with next_cursor
+	// while has_more: walk the pages until the end or -n.
+	hc := newConn()
+	var files []listedFile
+	hasMore := false
+	cursor := ""
+	for page := 0; ; page++ {
+		if page >= maxListPages {
+			hasMore = true
+			break
+		}
+		pageURL := listURL
+		if cursor != "" {
+			pageURL += "?cursor=" + url.QueryEscape(cursor)
+		}
+		var result struct {
+			Files      []listedFile `json:"files"`
+			HasMore    bool         `json:"has_more"`
+			NextCursor string       `json:"next_cursor"`
+		}
+		if err := apiGetJSON(hc, pageURL, apiKey, &result); err != nil {
+			return err
+		}
+		files = append(files, result.Files...)
+		if limitVal > 0 && len(files) >= limitVal {
+			hasMore = result.HasMore || len(files) > limitVal
+			files = files[:limitVal]
+			break
+		}
+		if !result.HasMore || result.NextCursor == "" || !isValidCursor(result.NextCursor) {
+			break
+		}
+		cursor = result.NextCursor
 	}
 
 	if jsonMode {
-		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "files": result.Files})
+		if files == nil {
+			files = []listedFile{}
+		}
+		writeJSON(struct {
+			OK      bool         `json:"ok"`
+			Files   []listedFile `json:"files"`
+			HasMore bool         `json:"has_more"`
+		}{true, files, hasMore})
 		return nil
 	}
 
-	if len(result.Files) == 0 {
+	if len(files) == 0 {
 		fmt.Fprintf(os.Stderr, "%sNo files found.%s\n", c(cGray), c(cReset))
 		return nil
 	}
 
-	for _, f := range result.Files {
+	for _, f := range files {
 		status := "active"
 		statusColor := c(cGreen)
 		if f.Expired {
@@ -208,53 +278,75 @@ func runList(args []string) error {
 		if f.UploaderOnly {
 			fmt.Fprintf(os.Stderr, " %s[private]%s", c(cBlue), c(cReset))
 		}
+		if f.IsNote {
+			fmt.Fprintf(os.Stderr, " %s[note]%s", c(cGray), c(cReset))
+		}
 		fmt.Fprintln(os.Stderr)
 		fmt.Fprintf(os.Stderr, "  %s%s%s\n", c(cLightBlue), stripControl(f.Link), c(cReset))
 	}
+	if hasMore {
+		fmt.Fprintf(os.Stderr, "  %s… more files not shown%s\n", c(cGray), c(cReset))
+	}
 	return nil
+}
+
+// isValidCursor accepts the server's cursor shapes: "<unix µs>" or
+// "<unix µs>.<token>".
+func isValidCursor(s string) bool {
+	if s == "" || len(s) > 40 {
+		return false
+	}
+	for _, r := range s {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && r != '.' {
+			return false
+		}
+	}
+	return true
 }
 
 func runDelete(args []string) error {
 	fs := flag.NewFlagSet("delete", flag.ContinueOnError)
 	var serverVal string
 	fs.StringVar(&serverVal, "server", "https://ttl.space", "server URL")
+	var manageKey string
+	fs.StringVar(&manageKey, "k", "", "management key printed by ttl send")
+	fs.StringVar(&manageKey, "manage-key", "", "management key printed by ttl send")
 	fs.Usage = func() {
 		if !jsonMode {
-			fmt.Fprintln(os.Stderr, "Usage: ttl delete [--server URL] <token>")
+			fmt.Fprintln(os.Stderr, "Usage: ttl delete [-k MANAGE_KEY] [--server URL] <token or link>")
 		}
 	}
 	if jsonMode {
 		fs.SetOutput(io.Discard)
 	}
-	if err := fs.Parse(args); err != nil {
+	pos, err := parseArgs(fs, args)
+	if err != nil {
 		return err
 	}
-
-	if fs.NArg() != 1 {
-		return fmt.Errorf("Usage: ttl delete <token>")
+	if len(pos) != 1 {
+		return fmt.Errorf("Usage: ttl delete [-k MANAGE_KEY] <token or link>")
 	}
 
 	if err := validateServerURL(serverVal); err != nil {
 		return err
 	}
 
-	token := fs.Arg(0)
-	// Accept full URL or bare token
-	if len(token) > 10 {
-		if u, err := url.Parse(token); err == nil && u.Path != "" {
-			parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-			if len(parts) > 0 {
-				token = parts[len(parts)-1]
-			}
-		}
-	}
-	if !isToken(token) {
-		return fmt.Errorf("Invalid token: %s (expected 10 alphanumeric characters)", token)
+	token, err := tokenFromArg(pos[0])
+	if err != nil {
+		return err
 	}
 
-	apiKey := loadAPIKey()
-	if apiKey == "" {
-		return fmt.Errorf("No API key configured. Run: ttl activate <key>")
+	// The upload's management key (any plan) or the Orbit key (owner).
+	var apiKey string
+	if manageKey != "" {
+		if err := validateManageKey(manageKey); err != nil {
+			return err
+		}
+	} else {
+		apiKey = loadAPIKey()
+		if apiKey == "" {
+			return fmt.Errorf("No Orbit key configured and no management key given\nRun: ttl activate <key>, or pass -k <manage key> (printed by ttl send)")
+		}
 	}
 
 	deleteURL, err := url.JoinPath(serverVal, "/v1/files/"+token)
@@ -262,70 +354,156 @@ func runDelete(args []string) error {
 		return fmt.Errorf("Invalid server URL: %w", err)
 	}
 
-	client := newTCPClient(30 * time.Second)
-	req, err := http.NewRequest("DELETE", deleteURL, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), apiTimeout)
+	defer cancel()
+	req, err := newRequest(ctx, http.MethodDelete, deleteURL, nil)
 	if err != nil {
 		return err
 	}
-	setAPIKeyHeader(req.Header, apiKey)
+	if manageKey != "" {
+		req.Header.Set("X-Manage-Key", manageKey)
+	} else {
+		setAPIKeyHeader(req.Header, apiKey)
+	}
 
-	resp, err := client.Do(req)
+	resp, err := newConn().do(req)
 	if err != nil {
 		return fmt.Errorf("Request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
+	detail := readDetail(resp)
 
 	switch resp.StatusCode {
-	case 204:
+	case http.StatusNoContent:
 		if jsonMode {
-			_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "token": token, "deleted": true})
+			writeJSON(struct {
+				OK      bool   `json:"ok"`
+				Token   string `json:"token"`
+				Deleted bool   `json:"deleted"`
+			}{true, token, true})
 		} else {
 			fmt.Fprintf(os.Stderr, "%sDeleted:%s %s%s%s\n", c(cGreen), c(cReset), c(cBold), token, c(cReset))
 		}
 		return nil
-	case 401:
-		return fmt.Errorf("Invalid or expired API key")
-	case 403:
-		return fmt.Errorf("File deletion requires an Orbit plan")
-	case 404:
+	case http.StatusUnauthorized:
+		return fmt.Errorf("Invalid or expired API key\nRun: ttl activate <key> with a valid key, or ttl deactivate to use the free plan")
+	case http.StatusForbidden:
+		return fmt.Errorf("File deletion requires an Orbit plan key, or the upload's management key (-k)")
+	case http.StatusNotFound:
+		if manageKey != "" {
+			return fmt.Errorf("File not found: wrong management key, or the file is already gone")
+		}
 		return fmt.Errorf("File not found or not owned by this key")
+	case http.StatusBadGateway, http.StatusServiceUnavailable:
+		return fmt.Errorf("Storage temporarily unavailable, try again later")
 	default:
+		if detail != "" {
+			return fmt.Errorf("Server returned %d: %s", resp.StatusCode, detail)
+		}
 		return fmt.Errorf("Server returned %d", resp.StatusCode)
 	}
 }
 
-func fetchLimits(serverURL, apiKey string) (map[string]any, error) {
+// tokenFromArg accepts a bare token or a link and returns the token.
+func tokenFromArg(s string) (string, error) {
+	if isToken(s) {
+		return s, nil
+	}
+	if u, err := url.Parse(s); err == nil && u.Host != "" {
+		parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+		if t := parts[len(parts)-1]; isToken(t) {
+			return t, nil
+		}
+	}
+	return "", fmt.Errorf("Invalid token: %s (expected a 10-character token or a ttl.space link)", stripControl(s))
+}
+
+// serverError is a non-2xx answer from the API.
+type serverError struct {
+	status int
+	detail string
+}
+
+func (e *serverError) Error() string {
+	switch e.status {
+	case http.StatusUnauthorized:
+		return "Invalid or expired API key\nRun: ttl activate <key> with a valid key, or ttl deactivate to use the free plan"
+	case http.StatusBadGateway, http.StatusServiceUnavailable:
+		return "Storage temporarily unavailable, try again later"
+	}
+	if e.detail != "" {
+		return fmt.Sprintf("Server returned %d: %s", e.status, e.detail)
+	}
+	return fmt.Sprintf("Server returned %d", e.status)
+}
+
+// apiGetJSON fetches an API document with the Orbit key, at most 1 MiB.
+func apiGetJSON(hc *httpConn, rawURL, apiKey string, out any) error {
+	ctx, cancel := context.WithTimeout(context.Background(), apiTimeout)
+	defer cancel()
+	req, err := newRequest(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return err
+	}
+	setAPIKeyHeader(req.Header, apiKey)
+	resp, err := hc.do(req)
+	if err != nil {
+		return fmt.Errorf("Cannot reach server: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden {
+		return fmt.Errorf("File listing requires an Orbit plan")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return &serverError{status: resp.StatusCode, detail: readDetail(resp)}
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(out); err != nil {
+		return fmt.Errorf("Invalid server response: %w", err)
+	}
+	return nil
+}
+
+// fetchLimits reads GET /v1/limits for the key's plan. A rejected key is
+// a *serverError with status 401; an unreachable server wraps the
+// transport error.
+func fetchLimits(hc *httpConn, serverURL, apiKey string) (map[string]any, error) {
 	limitsURL, err := url.JoinPath(serverURL, "/v1/limits")
 	if err != nil {
 		return nil, fmt.Errorf("Invalid server URL: %w", err)
 	}
 
-	client := newTCPClient(10 * time.Second)
-	req, err := http.NewRequest("GET", limitsURL, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, err := newRequest(ctx, http.MethodGet, limitsURL, nil)
 	if err != nil {
 		return nil, err
 	}
 	setAPIKeyHeader(req.Header, apiKey)
 
-	resp, err := client.Do(req)
+	resp, err := hc.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("Cannot reach server: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == 401 {
-		return nil, fmt.Errorf("Invalid or expired API key")
-	}
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("Server returned %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		return nil, &serverError{status: resp.StatusCode, detail: readDetail(resp)}
 	}
 
 	var limits map[string]any
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&limits); err != nil {
 		return nil, fmt.Errorf("Invalid server response: %w", err)
 	}
+	if limits == nil {
+		return nil, fmt.Errorf("Invalid server response: empty limits")
+	}
 	return limits, nil
+}
+
+// isKeyRejected reports whether err is the server refusing the API key.
+func isKeyRejected(err error) bool {
+	var se *serverError
+	return errors.As(err, &se) && se.status == http.StatusUnauthorized
 }
 
 func jsonInt64(v any) int64 {

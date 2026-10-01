@@ -14,16 +14,19 @@ import (
 // give byte lengths; the *Offset constants give field positions inside the
 // fixed-size header. Bumping any of these is a wire-format break.
 const (
-	Magic        = "TTL\x01"
-	MagicSize    = 4 // len(Magic)
-	SaltSize     = 16
-	NonceSize    = 24
-	KeySize      = 32
-	TagSize      = 16
-	MetaLenSize  = 2           // 2 bytes, big-endian uint16
-	ChunkSize    = 65536       // 64 KB per plaintext chunk
-	MaxFilename  = 239         // keeps max encrypted metadata at 268 bytes
-	MaxFileBytes = 268_435_456 // 256 MB
+	Magic       = "TTL\x01"
+	MagicSize   = 4 // len(Magic)
+	SaltSize    = 16
+	NonceSize   = 24
+	KeySize     = 32
+	TagSize     = 16
+	MetaLenSize = 2     // 2 bytes, big-endian uint16
+	ChunkSize   = 65536 // 64 KB per plaintext chunk
+	MaxFilename = 239   // keeps max encrypted metadata at 268 bytes
+	// MaxFileBytes is the fallback upload ceiling, the free plan's 2 GiB. The
+	// CLI takes the real limit from GET /v1/limits (10 GiB on Orbit) and only
+	// falls back to this when the server does not advertise max_file_bytes.
+	MaxFileBytes = 2_147_483_648 // 2 GiB
 	ArgonTime    = 3
 	ArgonMemory  = 64 * 1024 // 64 MB of RAM
 	ArgonThreads = 1
@@ -83,8 +86,9 @@ func EncryptedSize(fileSize uint64, filename string) int64 {
 	if fileSize%ChunkSize > 0 {
 		numChunks++
 	}
-	// A zero-byte file has zero chunks. fileSize is bounded by MaxFileBytes
-	// (256 MB), so the int64 conversions are guaranteed not to overflow.
+	// A zero-byte file has zero chunks. fileSize is bounded by the server's
+	// plan limit (10 GiB on Orbit) and by parseMetadata's 1 TB cap, so the
+	// int64 conversions cannot overflow.
 	return int64(HeaderSize) + int64(metaCipherLen) +
 		int64(fileSize) + int64(numChunks)*int64(TagSize) //nolint:gosec
 }

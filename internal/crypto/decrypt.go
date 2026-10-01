@@ -72,7 +72,7 @@ func DecryptStreamWithKey(r io.Reader, key []byte, outDir string) (string, strin
 	// Decrypt the metadata (filename, file size, chunk size)
 	metaCipher := make([]byte, metaEncLen)
 	if _, err := io.ReadFull(r, metaCipher); err != nil {
-		return "", "", 0, fmt.Errorf("Incomplete metadata")
+		return "", "", 0, fmt.Errorf("Incomplete metadata: %w", err)
 	}
 	metaPlain, err := aead.Open(nil, xorNonce(nonce, 0), metaCipher, nil)
 	if err != nil {
@@ -129,7 +129,7 @@ func DecryptStreamWithKey(r io.Reader, key []byte, outDir string) (string, strin
 			cipherLen = int(lastPlainLen) + TagSize //nolint:gosec // lastPlainLen < chunkSize
 		}
 		if _, err = io.ReadFull(r, buf[:cipherLen]); err != nil {
-			return "", "", 0, fmt.Errorf("File truncated at chunk 1")
+			return "", "", 0, fmt.Errorf("File truncated at chunk 1: %w", err)
 		}
 		firstPlain, err = aead.Open(nil,
 			xorNonce(nonce, 1), buf[:cipherLen], nil)
@@ -186,7 +186,9 @@ func DecryptStreamWithKey(r io.Reader, key []byte, outDir string) (string, strin
 			cipherLen = int(lastPlainLen) + TagSize //nolint:gosec // lastPlainLen < chunkSize
 		}
 		if _, err = io.ReadFull(r, buf[:cipherLen]); err != nil {
-			return "", "", 0, fmt.Errorf("File truncated at chunk %d", chunkIndex)
+			// The reader's own error is the cause worth showing: a network
+			// download that gave up says so here.
+			return "", "", 0, fmt.Errorf("File truncated at chunk %d: %w", chunkIndex, err)
 		}
 		plaintext, err = aead.Open(plaintext[:0],
 			xorNonce(nonce, chunkIndex), buf[:cipherLen], nil)

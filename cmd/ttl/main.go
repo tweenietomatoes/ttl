@@ -1,5 +1,5 @@
-// Package main is the ttl CLI: send / get / list / delete files on ttl.space
-// with end-to-end encryption.
+// Package main is the ttl CLI: send / get / status / list / delete files on
+// ttl.space with end-to-end encryption.
 package main
 
 import (
@@ -8,12 +8,26 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 )
 
 // version is set at build time by goreleaser via ldflags.
 var version = "dev"
 
 var jsonMode bool // set by the --json flag
+
+// commands maps a subcommand to its runner. Each runner parses its own
+// flags and answers flag.ErrHelp for -h.
+var commands = map[string]func([]string) error{
+	"send":       runSend,
+	"get":        runGet,
+	"status":     runStatus,
+	"activate":   runActivate,
+	"deactivate": runDeactivate,
+	"plan":       runPlan,
+	"list":       runList,
+	"delete":     runDelete,
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -53,179 +67,134 @@ func main() {
 	}
 
 	switch args[0] {
-	case "send":
-		if err := runSend(args[1:]); err != nil {
-			if errors.Is(err, flag.ErrHelp) {
-				exitHelp()
-			}
-			exitError(err)
-		}
-	case "get":
-		if err := runGet(args[1:]); err != nil {
-			if errors.Is(err, flag.ErrHelp) {
-				exitHelp()
-			}
-			exitError(err)
-		}
-	case "activate":
-		if err := runActivate(args[1:]); err != nil {
-			exitError(err)
-		}
+	case "version", "--version", "-v":
 		if jsonMode {
-			_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "activated": true})
-		}
-	case "deactivate":
-		if err := runDeactivate(args[1:]); err != nil {
-			exitError(err)
-		}
-		if jsonMode {
-			_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "deactivated": true})
-		}
-	case "plan":
-		if err := runPlan(args[1:]); err != nil {
-			if errors.Is(err, flag.ErrHelp) {
-				exitHelp()
-			}
-			exitError(err)
-		}
-	case "list":
-		if err := runList(args[1:]); err != nil {
-			if errors.Is(err, flag.ErrHelp) {
-				exitHelp()
-			}
-			exitError(err)
-		}
-	case "delete":
-		if err := runDelete(args[1:]); err != nil {
-			if errors.Is(err, flag.ErrHelp) {
-				exitHelp()
-			}
-			exitError(err)
-		}
-	case "version":
-		if jsonMode {
-			_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
-				"ok":      true,
-				"version": version,
-			})
+			writeJSON(struct {
+				OK      bool   `json:"ok"`
+				Version string `json:"version"`
+			}{true, version})
 		} else {
 			fmt.Printf("ttl %s\n", version)
 		}
-	default:
+		return
+	case "help", "-h", "--help":
+		if !jsonMode {
+			printUsage()
+		}
+		exitHelp()
+	}
+
+	run, ok := commands[args[0]]
+	if !ok {
 		if jsonMode {
 			exitError(fmt.Errorf("Unknown command: %s", stripControl(args[0])))
 		}
+		fmt.Fprintf(os.Stderr, "%sError:%s Unknown command: %s\n\n", c(cRed, cBold), c(cReset), stripControl(args[0]))
 		printUsage()
 		os.Exit(1)
 	}
+	if err := run(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			exitHelp()
+		}
+		exitError(err)
+	}
 }
 
+// exitHelp ends a -h run. The flag package has printed the usage text by
+// then; in --json mode a note goes out instead.
 func exitHelp() {
 	if jsonMode {
-		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
-			"ok":    false,
-			"error": "Use --help without --json for usage information",
-		})
-		os.Exit(0)
+		writeJSON(jsonError{Error: "Use --help without --json for usage information"})
 	}
 	os.Exit(0)
 }
 
 func exitError(err error) {
 	if jsonMode {
-		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
-			"ok":    false,
-			"error": err.Error(),
-		})
+		writeJSON(jsonError{Error: err.Error()})
 	} else {
 		fmt.Fprintf(os.Stderr, "%sError:%s %v\n", c(cRed, cBold), c(cReset), err)
 	}
 	os.Exit(1)
 }
 
+// jsonError is the --json shape of a failure: {"ok":false,"error":"…"}.
+type jsonError struct {
+	OK    bool   `json:"ok"`
+	Error string `json:"error"`
+}
+
+// writeJSON prints one JSON document on stdout, the whole output of a
+// --json run.
+func writeJSON(v any) {
+	_ = json.NewEncoder(os.Stdout).Encode(v)
+}
+
+// usageText is the help page. Markers in braces are colour codes,
+// replaced in printUsage: {T} title, {B} bold, {C} command, {F} flag,
+// {D} dim, {U} url, {R} reset.
+const usageText = `{T}ttl.space{R} {D}— Encrypted file transfer. Ephemeral by design, permanent with Orbit.{R}
+
+{D}Files are encrypted on your device before upload.{R}
+{D}The server never sees your data or password.{R}
+{D}Passwords are auto-generated during send if not provided.{R}
+{D}Default time to live is 7 days.{R}
+
+{B}Usage:{R}
+  {C}ttl send{R} {F}[-p P | --password-stdin | --password-file F] [-t DUR] [-b] [-u] [--timeout D]{R} {B}FILE{R}
+  {C}ttl get{R}  {F}[-p P | --password-stdin | --password-file F] [-o DIR] [--timeout D]{R} {B}URL or TOKEN{R}
+  {C}ttl status{R} {B}<token>{R} {F}-k KEY{R}        {D}Status of an upload (management key from send){R}
+  {C}ttl delete{R} {B}<token>{R} {F}[-k KEY]{R}      {D}Delete a file early (Orbit key, or the management key){R}
+  {C}ttl activate{R} {F}[--key-stdin | --key-file F | <key>]{R}   {D}Activate Orbit plan{R}
+  {C}ttl deactivate{R}                  {D}Remove stored Orbit key{R}
+  {C}ttl plan{R}                        {D}Show current plan and usage{R}
+  {C}ttl list{R} {F}[-n N]{R}                 {D}List uploads (Orbit){R}
+  {C}ttl version{R}
+
+{B}Options:{R}
+  {F}-p, --password P{R}       {D}Encryption/decryption password{R}
+  {F}-t, --ttl DUR{R}          {D}Time to live: 5m,10m,15m,30m,1h,2h,3h,6h,12h,24h,1d-7d (default: 7d, Orbit: 14d,15d,28d,30d,permanent){R}
+  {F}-b, --burn{R}             {D}Burn after reading (file is deleted after first download){R}
+  {F}-u, --uploader-only{R}    {D}Private file (Orbit): only the uploader's API key can download it{R}
+  {F}-o, --output DIR{R}       {D}Output directory for downloaded file (default: current directory){R}
+  {F}-k, --manage-key KEY{R}   {D}Management key printed by ttl send (status / early delete on any plan){R}
+  {F}-n, --limit N{R}          {D}List at most N files (default: all){R}
+  {F}--server URL{R}           {D}Server to talk to (default: https://ttl.space){R}
+  {F}--json{R}                 {D}Output JSON to stdout (for scripts and AI agents){R}
+  {F}--timeout D{R}            {D}Transfer timeout (e.g. 5m, 1h). Default: auto (assumes 1 Mbps){R}
+  {F}--password-stdin{R}       {D}Read password from stdin (for scripts){R}
+  {F}--password-file F{R}      {D}Read password from file (for scripts){R}
+  {F}-h3, --http3{R}           {D}Try HTTP/3 (QUIC) first, fall back to TCP if unavailable{R}
+
+{B}Password:{R} Auto-generated if not provided during send.
+  {D}Auto-detected from ttl.password next to binary or ~/.ttl/password.{R}
+  {D}-p / --password is visible in ps output and shell history.{R}
+  {D}Prefer --password-stdin or --password-file in scripts.{R}
+  {D}--json auto-generates a password if none is provided.{R}
+
+{B}Manage key:{R} {D}Printed once by ttl send (manage_key in --json). It lets you check the{R}
+  {D}upload's status or delete it early on any plan: ttl status|delete TOKEN -k KEY.{R}
+
+{B}Orbit key:{R} {D}Auto-detected from TTL_API_KEY env, ttl.key next to binary, or ~/.ttl/key.{R}
+  {D}Passed automatically on get/probe so private (uploader-only) files open transparently.{R}
+
+{B}Transfers:{R} {D}Large uploads go in resumable parts and interrupted downloads resume,{R}
+  {D}so a dropped connection continues where it stopped. Ctrl-C cancels cleanly.{R}
+
+{B}Download:{R} You can pass a full URL or just the 10-character token.
+  {C}ttl get aBcDeFgHiJ{R}  is the same as  {C}ttl get{R} {U}https://ttl.space/aBcDeFgHiJ{R}
+`
+
 func printUsage() {
-	B := c(cBold)          // bold
-	R := c(cReset)         // reset
-	T := c(cBlue, cBold)   // title
-	F := c(cAmber)         // flags
-	D := c(cGray)          // dim/description
-	U := c(cLightBlue)     // url
-	Cm := c(cTeal)         // command
-
-	fmt.Fprintf(os.Stderr, `%sttl.space%s %s— Encrypted file transfer. Ephemeral by design, permanent with Orbit.%s
-
-%sFiles are encrypted on your device before upload.%s
-%sThe server never sees your data or password.%s
-%sPasswords are auto-generated during send if not provided.%s
-%sDefault time to live is 7 days.%s
-
-%sUsage:%s
-  %sttl send%s %s[-p P | --password P | --password-stdin | --password-file F] [-t DUR] [-b] [-u] [--json] [--timeout D]%s %sFILE%s
-  %sttl get%s  %s[-p P | --password P | --password-stdin | --password-file F] [--json] [--timeout D] [-o DIR]%s %sURL or TOKEN%s
-  %sttl activate%s %s<key>%s           %sActivate Orbit plan%s
-  %sttl deactivate%s               %sRemove stored Orbit key%s
-  %sttl plan%s                     %sShow current plan and usage%s
-  %sttl list%s                     %sList recent uploads (Orbit)%s
-  %sttl delete%s %s<token>%s           %sDelete a file early (Orbit)%s
-  %sttl version%s
-
-%sOptions:%s
-  %s-p, --password P%s       %sEncryption/decryption password%s
-  %s-t, --ttl DUR%s          %sTime to live: 5m,10m,15m,30m,1h,2h,3h,6h,12h,24h,1d-7d (default: 7d, Orbit: up to 30d or permanent)%s
-  %s-b, --burn%s             %sBurn after reading (file is deleted after first download)%s
-  %s-u, --uploader-only%s    %sPrivate file (Orbit): only the uploader's API key can download it%s
-  %s-o, --output DIR%s       %sOutput directory for downloaded file (default: current directory)%s
-  %s--json%s                 %sOutput JSON to stdout (for scripts and AI agents)%s
-  %s--timeout D%s            %sTransfer timeout (e.g. 5m, 1h). Default: auto (assumes 1 Mbps)%s
-  %s--password-stdin%s       %sRead password from stdin (for scripts)%s
-  %s--password-file F%s      %sRead password from file (for scripts)%s
-  %s-h3, --http3%s           %sTry HTTP/3 (QUIC) first, fall back to TCP if unavailable%s
-
-%sPassword:%s Auto-generated if not provided during send.
-  %sAuto-detected from ttl.password next to binary or ~/.ttl/password.%s
-  %s-p / --password is visible in ps output and shell history.%s
-  %sPrefer --password-stdin or --password-file in scripts.%s
-  %s--json auto-generates a password if none is provided.%s
-
-%sOrbit key:%s %sAuto-detected from TTL_API_KEY env, ttl.key next to binary, or ~/.ttl/key.%s
-  %sPassed automatically on get/probe so private (uploader-only) files open transparently.%s
-
-%sDownload:%s You can pass a full URL or just the 10-character token.
-  %sttl get aBcDeFgHiJ%s  is the same as  %sttl get%s %s%s%s
-`,
-		T, R, D, R,
-		D, R,
-		D, R,
-		D, R,
-		D, R,
-		B, R,
-		Cm, R, F, R, B, R,
-		Cm, R, F, R, B, R,
-		Cm, R, B, R, D, R,
-		Cm, R, D, R,
-		Cm, R, D, R,
-		Cm, R, D, R,
-		Cm, R, B, R, D, R,
-		Cm, R,
-		B, R,
-		F, R, D, R,
-		F, R, D, R,
-		F, R, D, R,
-		F, R, D, R,
-		F, R, D, R,
-		F, R, D, R,
-		F, R, D, R,
-		F, R, D, R,
-		F, R, D, R,
-		F, R, D, R,
-		B, R,
-		D, R,
-		D, R,
-		D, R,
-		D, R,
-		B, R, D, R,
-		D, R,
-		B, R,
-		Cm, R, Cm, R, U, "https://ttl.space/aBcDeFgHiJ", R,
+	r := strings.NewReplacer(
+		"{T}", c(cBlue, cBold),
+		"{B}", c(cBold),
+		"{C}", c(cTeal),
+		"{F}", c(cAmber),
+		"{D}", c(cGray),
+		"{U}", c(cLightBlue),
+		"{R}", c(cReset),
 	)
+	fmt.Fprint(os.Stderr, r.Replace(usageText))
 }

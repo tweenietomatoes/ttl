@@ -1,18 +1,18 @@
 module github.com/tweenietomatoes/ttl
 
-go 1.26
+go 1.26.0
 
-toolchain go1.26.2
+toolchain go1.27.1
 
 require (
-	github.com/quic-go/quic-go v0.59.0
-	golang.org/x/crypto v0.49.0
-	golang.org/x/term v0.41.0
+	github.com/quic-go/quic-go v0.63.0
+	golang.org/x/crypto v0.57.0
+	golang.org/x/term v0.46.0
 )
 
 require (
 	github.com/quic-go/qpack v0.6.0 // indirect
-	golang.org/x/net v0.51.0 // indirect
-	golang.org/x/sys v0.42.0 // indirect
-	golang.org/x/text v0.35.0 // indirect
+	golang.org/x/net v0.59.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 )

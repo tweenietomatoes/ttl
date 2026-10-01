@@ -4,17 +4,16 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"math/big"
-	"net/http"
-	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -74,22 +73,23 @@ func runSend(args []string) error {
 	if jsonMode {
 		fs.SetOutput(io.Discard)
 	}
-	if err := fs.Parse(args); err != nil {
+	pos, err := parseArgs(fs, args)
+	if err != nil {
 		return err
 	}
-
-	if fs.NArg() != 1 {
-		return fmt.Errorf("Usage: ttl send [-p PASS] [-t DUR] [-b] FILE")
+	if len(pos) != 1 {
+		return fmt.Errorf("Usage: ttl send [-p PASS] [-t DUR] [-b] [-u] FILE")
 	}
 
 	if err := validateServerURL(serverVal); err != nil {
 		return err
 	}
+	serverVal = strings.TrimRight(serverVal, "/")
 
 	// Validate the file before prompting for a password, so the user
 	// is not asked for input when the file path is already invalid.
-	path := fs.Arg(0)
-	info, err := os.Stat(path)
+	path := pos[0]
+	info, err := os.Stat(path) //nolint:gosec // G703: the file the user asked to send
 	if err != nil {
 		return err
 	}
@@ -125,9 +125,10 @@ func runSend(args []string) error {
 	}
 
 	// Fetch server-side limits (respects plan tier)
-	serverLimits, limitsErr := fetchLimits(serverVal, apiKey)
-	if limitsErr != nil {
-		return fmt.Errorf("Cannot reach server: %w", limitsErr)
+	hc := newConn()
+	serverLimits, err := fetchLimits(hc, serverVal, apiKey)
+	if err != nil {
+		return err
 	}
 	maxFileBytes := int64(crypto.MaxFileBytes)
 	if mfb := jsonInt64(serverLimits["max_file_bytes"]); mfb > 0 {
@@ -196,7 +197,8 @@ func runSend(args []string) error {
 		}
 	}()
 
-	encSize := crypto.EncryptedSize(uint64(info.Size()), filepath.Base(path)) //nolint:gosec // info.Size() is non-negative file size
+	name := filepath.Base(path)
+	encSize := crypto.EncryptedSize(uint64(info.Size()), name) //nolint:gosec // info.Size() is non-negative file size
 	xferTimeout, err := resolveTimeout(timeoutVal, encSize)
 	if err != nil {
 		return err
@@ -204,147 +206,107 @@ func runSend(args []string) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), xferTimeout)
 	defer cancel()
+	// Ctrl-C cancels the transfer: an open upload session is handed back
+	// to the server instead of holding a slot until its idle sweep.
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	uploadURL, err := url.JoinPath(serverVal, "/v1/files")
+	ttlHeader := strconv.Itoa(ttlSeconds)
+	if isPermanent {
+		ttlHeader = "permanent"
+	}
+	up := &uploader{
+		hc: hc, ctx: ctx, server: serverVal, apiKey: apiKey,
+		file: f, fileSize: info.Size(), name: name,
+		key: key, salt: salt, encSize: encSize,
+		tokenHash: tokenHash, ttl: ttlHeader, burn: burnVal, uploaderOnly: uploaderOnlyVal,
+		prog: newProgress(encSize, info.Size(), jsonMode),
+	}
+	res, err := up.run()
 	if err != nil {
-		return fmt.Errorf("Invalid server URL: %w", err)
+		return err
 	}
 
-	pr, pw := io.Pipe()
-	errCh := make(chan error, 1)
-	go func() {
-		err := crypto.EncryptStream(pw, f,
-			filepath.Base(path), uint64(info.Size()), key, salt) //nolint:gosec // info.Size() is non-negative file size
-		pw.CloseWithError(err)
-		errCh <- err
-	}()
+	// Server-controlled strings: strip control characters before printing
+	// so a malicious link can't hijack the terminal.
+	link := stripControl(res.Link)
+	token := res.Token
+	if !isToken(token) {
+		token = tokenFromLink(link)
+	}
+	manageKey := stripControl(res.ManageKey)
 
-	doUpload := func(client *http.Client) (*http.Response, error) {
-		req, reqErr := http.NewRequestWithContext(ctx, "PUT",
-			uploadURL, newProgressReader(pr, encSize, info.Size(), jsonMode))
-		if reqErr != nil {
-			return nil, fmt.Errorf("Invalid server URL: %w", reqErr)
-		}
-		req.ContentLength = encSize
-		req.Header.Set("Content-Type", "application/octet-stream")
-		if isPermanent {
-			req.Header.Set("X-TTL", "permanent")
-		} else {
-			req.Header.Set("X-TTL", strconv.Itoa(ttlSeconds))
-		}
-		req.Header.Set("X-Token-Hash", tokenHash)
-		setAPIKeyHeader(req.Header, apiKey)
-		if burnVal {
-			req.Header.Set("X-Burn-After-Reading", "true")
-		}
-		if uploaderOnlyVal {
-			req.Header.Set("X-Uploader-Only", "true")
-		}
-		return client.Do(req)
-	}
-
-	var resp *http.Response
-	if forceH3 {
-		resp, err = doUpload(newH3Client())
-		if err != nil {
-			if resp != nil {
-				_ = resp.Body.Close()
-			}
-			// QUIC failed, fall back to TCP
-			if !jsonMode {
-				fmt.Fprintf(os.Stderr, "\n%sH3: Falling back to TCP%s\n", c(cGray), c(cReset))
-			}
-			// Clean up the failed attempt and retry over TCP
-			cancel()
-			pw.CloseWithError(err)
-			<-errCh
-
-			ctx, cancel = context.WithTimeout(context.Background(), xferTimeout)
-			defer cancel()
-			pr, pw = io.Pipe()
-			errCh = make(chan error, 1)
-			if _, seekErr := f.Seek(0, io.SeekStart); seekErr != nil {
-				return fmt.Errorf("Cannot retry: %w", seekErr)
-			}
-			go func() {
-				err := crypto.EncryptStream(pw, f,
-					filepath.Base(path), uint64(info.Size()), key, salt) //nolint:gosec // info.Size() is non-negative file size
-				pw.CloseWithError(err)
-				errCh <- err
-			}()
-			resp, err = doUpload(newTCPClient(xferTimeout))
-		}
-	} else {
-		resp, err = doUpload(newTCPClient(xferTimeout))
-	}
-	if err != nil {
-		if resp != nil {
-			_ = resp.Body.Close()
-		}
-		cancel()
-		pw.CloseWithError(err)
-		<-errCh
-		return fmt.Errorf("Upload failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if encErr := <-errCh; encErr != nil {
-		return fmt.Errorf("Encryption failed: %w", encErr)
-	}
-
-	if resp.StatusCode != http.StatusCreated {
-		return handleUploadError(resp)
-	}
-
-	var result struct {
-		Link string `json:"link"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&result); err != nil {
-		return fmt.Errorf("Invalid server response: %w", err)
-	}
-	if result.Link == "" {
-		return fmt.Errorf("Server returned empty link")
-	}
-	// Strip control characters from the link to prevent terminal injection
-	clean := stripControl(result.Link)
 	if jsonMode {
-		result := map[string]any{
-			"ok":            true,
-			"link":          clean,
-			"filename":      filepath.Base(path),
-			"size":          info.Size(),
-			"ttl":           ttlVal,
-			"burn":          burnVal,
-			"uploader_only": uploaderOnlyVal,
-			"is_permanent":  isPermanent,
+		out := struct {
+			OK                  bool   `json:"ok"`
+			Link                string `json:"link"`
+			Token               string `json:"token,omitempty"`
+			Filename            string `json:"filename"`
+			Size                int64  `json:"size"`
+			TTL                 string `json:"ttl"`
+			ExpiresIn           int64  `json:"expires_in,omitempty"`
+			ExpiresAt           int64  `json:"expires_at,omitempty"`
+			Burn                bool   `json:"burn"`
+			UploaderOnly        bool   `json:"uploader_only"`
+			IsPermanent         bool   `json:"is_permanent"`
+			ManageKey           string `json:"manage_key,omitempty"`
+			DailyBytesRemaining *int64 `json:"daily_bytes_remaining,omitempty"`
+			Password            string `json:"password,omitempty"`
+		}{
+			OK: true, Link: link, Token: token, Filename: name, Size: info.Size(), TTL: ttlVal,
+			Burn: burnVal, UploaderOnly: uploaderOnlyVal, IsPermanent: isPermanent,
+			ManageKey: manageKey, DailyBytesRemaining: res.DailyBytesRemaining,
+		}
+		if res.ExpiresIn > 0 {
+			out.ExpiresIn = res.ExpiresIn
+			out.ExpiresAt = time.Now().Unix() + res.ExpiresIn
 		}
 		if generated {
-			result["password"] = pass
+			out.Password = pass
 		}
-		_ = json.NewEncoder(os.Stdout).Encode(result)
-	} else {
-		fmt.Fprintf(os.Stderr, "%s·✧★◉%s Thank goodness, %s%s%s is in orbit %s(%s%s",
-			c(cGold), c(cReset),
-			c(cBold, cTeal), filepath.Base(path), c(cReset),
-			c(cGray), humanBytes(info.Size()), c(cReset))
-		if burnVal {
-			fmt.Fprintf(os.Stderr, "%s, self-destructs after download%s", c(cAmber), c(cReset))
-		}
-		if isPermanent {
-			fmt.Fprintf(os.Stderr, "%s, permanent%s", c(cBlue), c(cReset))
-		}
-		if uploaderOnlyVal {
-			fmt.Fprintf(os.Stderr, "%s, private — uploader's API key required to download%s", c(cBlue), c(cReset))
-		}
-		fmt.Fprintf(os.Stderr, "%s)%s\n", c(cGray), c(cReset))
-		fmt.Fprintf(os.Stderr, "%s%sIMPORTANT!%s %sSave your password — required to download and decrypt the file.%s\n",
-			c(cAmber), c(cBold), c(cReset), c(cAmber), c(cReset))
-		if generated {
-			fmt.Fprintf(os.Stderr, "%sPassword:%s %s%s%s\n", c(cGray), c(cReset), c(cBold, cWhite), pass, c(cReset))
-		}
-		fmt.Println(clean)
+		writeJSON(out)
+		return nil
 	}
+
+	fmt.Fprintf(os.Stderr, "%s·✧★◉%s Thank goodness, %s%s%s is in orbit %s(%s%s",
+		c(cGold), c(cReset),
+		c(cBold, cTeal), name, c(cReset),
+		c(cGray), humanBytes(info.Size()), c(cReset))
+	if res.ExpiresIn > 0 && !isPermanent {
+		fmt.Fprintf(os.Stderr, "%s, expires %s%s", c(cGray),
+			time.Now().Add(time.Duration(res.ExpiresIn)*time.Second).Format("2006-01-02 15:04"), c(cReset))
+	}
+	if burnVal {
+		fmt.Fprintf(os.Stderr, "%s, self-destructs after download%s", c(cAmber), c(cReset))
+	}
+	if isPermanent {
+		fmt.Fprintf(os.Stderr, "%s, permanent%s", c(cBlue), c(cReset))
+	}
+	if uploaderOnlyVal {
+		fmt.Fprintf(os.Stderr, "%s, private — uploader's API key required to download%s", c(cBlue), c(cReset))
+	}
+	fmt.Fprintf(os.Stderr, "%s)%s\n", c(cGray), c(cReset))
+	fmt.Fprintf(os.Stderr, "%s%sIMPORTANT!%s %sSave your password — required to download and decrypt the file.%s\n",
+		c(cAmber), c(cBold), c(cReset), c(cAmber), c(cReset))
+	if generated {
+		fmt.Fprintf(os.Stderr, "%sPassword:%s %s%s%s\n", c(cGray), c(cReset), c(cBold, cWhite), pass, c(cReset))
+	}
+	if manageKey != "" {
+		fmt.Fprintf(os.Stderr, "%sManage key:%s %s%s%s %s(ttl status / ttl delete -k)%s\n",
+			c(cGray), c(cReset), c(cBold, cWhite), manageKey, c(cReset), c(cGray), c(cReset))
+	}
+	fmt.Println(link)
 	return nil
+}
+
+// tokenFromLink is the last path element of link when it is a token.
+func tokenFromLink(link string) string {
+	if i := strings.LastIndexByte(link, '/'); i >= 0 {
+		if t := link[i+1:]; isToken(t) {
+			return t
+		}
+	}
+	return ""
 }
 
 const minPasswordLength = 8
@@ -575,32 +537,6 @@ func stripControl(s string) string {
 		}
 		return r
 	}, s)
-}
-
-func handleUploadError(resp *http.Response) error {
-	var p struct {
-		Detail string `json:"detail"`
-	}
-	_ = json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&p)
-	switch resp.StatusCode {
-	case 404:
-		return fmt.Errorf("Upload endpoint not found (server may be misconfigured)")
-	case 413:
-		if p.Detail != "" {
-			return fmt.Errorf("%s\nSee limits: https://ttl.space/usage", stripControl(p.Detail))
-		}
-		return fmt.Errorf("File too large\nSee limits: https://ttl.space/usage")
-	case 429:
-		if p.Detail != "" {
-			return fmt.Errorf("%s\nTry again later or see: https://ttl.space/usage", stripControl(p.Detail))
-		}
-		return fmt.Errorf("Rate limit exceeded\nTry again later or see: https://ttl.space/usage")
-	default:
-		if p.Detail != "" {
-			return fmt.Errorf("Upload failed: %s", stripControl(p.Detail))
-		}
-		return fmt.Errorf("Upload failed: server returned %d", resp.StatusCode)
-	}
 }
 
 // Estimates based on 1 Mbps speed plus a 2-minute buffer (minimum 5 minutes).

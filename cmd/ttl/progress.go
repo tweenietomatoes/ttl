@@ -9,13 +9,16 @@ import (
 	"golang.org/x/term"
 )
 
-type progressReader struct {
-	r       io.Reader
+// progress draws the transfer bar on stderr. Uploads add bytes as the
+// encryptor hands them to the transport and move the counter back when a
+// part is sent again; downloads add bytes as they arrive.
+type progress struct {
 	n       int64
 	total   int64
 	display int64
 	last    time.Time
-	tty     bool
+	quiet   bool // --json: nothing at all on stderr
+	tty     bool // bar only on a terminal
 	done    bool
 	frame   int
 	speed   float64   // EMA-smoothed bytes/sec
@@ -23,27 +26,26 @@ type progressReader struct {
 	prevT   time.Time // time of previous render
 }
 
-// newProgressReader wraps r with a progress bar.
-// total is the real byte count used for percentage calculation.
-// displaySize is the file size shown to the user (pass 0 to use total).
+// newProgress returns a bar for a transfer of total bytes on the wire.
+// displaySize is the file size shown to the user (0 = total).
 // quiet suppresses all output (used by --json mode).
-func newProgressReader(r io.Reader, total, displaySize int64, quiet bool) *progressReader {
+func newProgress(total, displaySize int64, quiet bool) *progress {
 	if displaySize <= 0 {
 		displaySize = total
 	}
-	return &progressReader{
-		r:       r,
+	return &progress{
 		total:   total,
 		display: displaySize,
+		quiet:   quiet,
 		tty:     !quiet && term.IsTerminal(int(os.Stderr.Fd())), //nolint:gosec // stderr fd is 0..2, fits int
 	}
 }
 
-func (p *progressReader) Read(buf []byte) (int, error) {
-	n, err := p.r.Read(buf)
+// add records n more bytes and redraws at most every 150 ms.
+func (p *progress) add(n int) {
 	p.n += int64(n)
 	if !p.tty || p.done {
-		return n, err
+		return
 	}
 	now := time.Now()
 	if p.prevT.IsZero() {
@@ -63,11 +65,58 @@ func (p *progressReader) Read(buf []byte) (int, error) {
 		p.last = now
 		p.render()
 	}
-	if err != nil {
-		p.render()
-		fmt.Fprintln(os.Stderr)
-		p.done = true
+}
+
+// set moves the counter to n: a part sent again starts over from its
+// offset, and the speed estimate restarts from there.
+func (p *progress) set(n int64) {
+	p.n = n
+	p.prevN = n
+	p.prevT = time.Time{}
+}
+
+// finish draws the final state and ends the line. Safe to call twice.
+func (p *progress) finish() {
+	if p.done {
+		return
 	}
+	p.done = true
+	if !p.tty {
+		return
+	}
+	p.render()
+	fmt.Fprintln(os.Stderr)
+}
+
+// note prints msg on its own line (a lost connection, a retry) and redraws
+// the bar under it. Silent in --json mode.
+func (p *progress) note(msg string) {
+	if p.quiet {
+		return
+	}
+	if !p.tty {
+		fmt.Fprintln(os.Stderr, msg)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "\r\033[K%s%s%s\n", c(cAmber), msg, c(cReset))
+	if !p.done {
+		p.render()
+	}
+}
+
+// reader counts what passes through r into the bar.
+func (p *progress) reader(r io.Reader) io.Reader {
+	return &progressReader{r: r, p: p}
+}
+
+type progressReader struct {
+	r io.Reader
+	p *progress
+}
+
+func (pr *progressReader) Read(buf []byte) (int, error) {
+	n, err := pr.r.Read(buf)
+	pr.p.add(n)
 	return n, err
 }
 
@@ -88,7 +137,7 @@ func barWidth() int {
 	return bw
 }
 
-func (p *progressReader) render() {
+func (p *progress) render() {
 	p.frame++
 
 	// Two flowing layers, nothing static:

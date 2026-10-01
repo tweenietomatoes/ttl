@@ -230,7 +230,7 @@ func TestAttack_ForgedMetadata_OversizeFilesize(t *testing.T) {
 
 	// These are within the sanity cap and must be accepted (policy is enforced server-side)
 	accepted := []uint64{
-		MaxFileBytes + 1, // just over 256 MB — valid for Orbit
+		MaxFileBytes + 1, // just over the free plan's 2 GiB — valid for Orbit
 		10_737_418_240,   // 10 GB — Orbit max
 		1 << 40,          // 1 TB — at the cap
 	}
@@ -838,8 +838,8 @@ func TestAttack_FormatConstants(t *testing.T) {
 	if MaxFilename != 239 {
 		t.Fatalf("MaxFilename should be 239, got %d", MaxFilename)
 	}
-	if MaxFileBytes != 268_435_456 {
-		t.Fatalf("MaxFileBytes should be 256MB, got %d", MaxFileBytes)
+	if MaxFileBytes != 2_147_483_648 {
+		t.Fatalf("MaxFileBytes should be 2 GiB, got %d", MaxFileBytes)
 	}
 	if ArgonTime != 3 {
 		t.Fatalf("ArgonTime should be 3, got %d", ArgonTime)

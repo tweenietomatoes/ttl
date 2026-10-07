@@ -116,8 +116,8 @@ The state is one of `active`, `expired`, `burned` or `deleted`. Files opened in 
 
 A dropped connection does not restart a transfer:
 
-- **Uploads** above 16 MiB go through the server's resumable upload API: the encrypted stream is sent in 16 MiB parts, each with a SHA-256 `Content-Digest`. A part that fails — a lost connection, a 5xx, bytes altered on the way — is sent again from memory; the rest of the file is untouched. Smaller files go in one request and are sent again in full if the connection breaks. The CLI gives up after 15 minutes without progress.
-- **Downloads** resume with a byte-range request from the last byte received; every 64 KiB chunk is authenticated on its own, so a resumed stream decrypts exactly like an unbroken one. Burn-after-reading files cannot be resumed — the server refuses ranges for them, so the first transfer must complete.
+- **Uploads** go from memory with a SHA-256 `Content-Digest` that the server checks before it stores anything. A file of up to 16 MiB (encrypted) goes in one request; a larger one goes in 16 MiB parts through the server's resumable upload API, two at a time. A request that fails (a lost connection, a 5xx, bytes altered on the way) is sent again, and parts already stored stay stored. The CLI gives up after 15 minutes without progress.
+- **Downloads** resume with a byte-range request from the last byte received; every 64 KiB chunk is authenticated on its own, so a resumed stream decrypts exactly like an unbroken one. A burn-after-reading file is used up when its download starts; the server hands its rest only to that same download, with the resume ticket that came with it, for a few minutes.
 - **Ctrl-C** cancels cleanly: an open upload session is handed back to the server, and a partial download is removed.
 
 ## 🪐 Orbit plan
@@ -220,7 +220,7 @@ ttl version
 | `-k, --manage-key KEY` | Management key printed by `ttl send` — status or early delete on any plan |
 | `-n, --limit N` | `ttl list`: stop after N files (default: all) |
 | `--server URL` | Server to talk to (default: `https://ttl.space`) |
-| `--timeout D` | Transfer timeout (e.g. `5m`, `1h`). Default: auto (assumes 1 Mbps) |
+| `--timeout D` | Give up after `D` (e.g. `30m`, `2h`). Default: none; a stalled transfer resumes, and gives up by itself if it cannot |
 | `--password-stdin` | Read password from stdin |
 | `--password-file F` | Read password from file |
 | `--json` | Output JSON to stdout (for scripts and AI agents) |

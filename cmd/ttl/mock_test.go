@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // mockAPI is an in-memory ttl.space for tests: limits, PUT /v1/files,
@@ -40,18 +42,52 @@ type mockAPI struct {
 	partAttempts      map[int]int
 	partDigests       map[int]string
 	lastUploadHeaders http.Header // PUT /v1/files or POST /v1/uploads
+	// fileHook answers the attempt-th PUT /v1/files with status (and
+	// detail) instead of storing it; 0 stores it. attempt starts at 1.
+	fileHook func(attempt int) (status int, detail string)
 	// partHook answers a part request with status (and detail) instead of
 	// storing it; 0 stores it. attempt starts at 1.
 	partHook func(n, attempt int) (status int, detail string)
+	// bodyRate (bytes/s, 0 = unlimited) reads every part body through one
+	// shared bucket: a slow uplink that concurrent parts share.
+	bodyRate int64
+	rateMu   sync.Mutex
+	rateNext time.Time
+	// stallPart: the first attempt of this part stops being read halfway
+	// (a connection that died silently) until the client gives up on it.
+	stallPart int
 	// completeHook answers a complete request with status and body
 	// instead of assembling; 0 assembles.
 	completeHook func(attempt int) (status int, body string)
+	// cutCompletes: the first this many answers to complete break off
+	// after a few bytes; the upload is done all the same.
+	cutCompletes int
 
 	// Downloads
-	dropAfter       int64 // first full download: close the connection after this many bytes
-	dropped         bool
-	ignoreRange     bool // answer a Range request with the whole file (200)
-	burn            bool // refuse ranges (400) like the server does for one-time files
+	dropAfter   int64 // first full download: close the connection after this many bytes
+	dropped     bool
+	ignoreRange bool   // answer a Range request with the whole file (200)
+	burn        bool   // refuse ranges (400) like the server does for one-time files
+	ticket      string // with burn: the first answer's X-Resume-Ticket; a range bringing it is served
+	// rangeHook answers the attempt-th range request with this status
+	// instead of serving it (0 serves). attempt starts at 1.
+	rangeHook func(attempt int) int
+	// dropRanges: range answers are also cut after dropAfter bytes, this many times.
+	dropRanges int
+	// dropAtStart: the first full download sends its headers, then hangs up.
+	dropAtStart bool
+	// newTicket: a full download after the first answers with this ticket.
+	newTicket string
+	// silentAfter: the first full download sends this many bytes, then
+	// nothing, with the connection kept open (a path that died silently).
+	silentAfter int64
+	// fullHook answers the attempt-th full (not ranged) download with this
+	// status instead of serving it (0 serves). attempt starts at 1.
+	fullHook  func(attempt int) int
+	fullCalls int
+	// cutAfterLast: the first full download sends every byte, chunked, then
+	// hangs up before the end of the stream.
+	cutAfterLast    bool
 	rangeRequests   []string
 	downloadHeaders http.Header
 
@@ -159,9 +195,23 @@ func (m *mockAPI) putFile(w http.ResponseWriter, r *http.Request) {
 	data, err := io.ReadAll(r.Body)
 	m.mu.Lock()
 	m.putCalls++
+	attempt := m.putCalls
 	m.lastUploadHeaders = r.Header.Clone()
+	hook := m.fileHook
 	m.mu.Unlock()
 	if err != nil {
+		return
+	}
+	if hook != nil {
+		if status, detail := hook(attempt); status != 0 {
+			m.problem(w, status, detail)
+			return
+		}
+	}
+	// Like the server: the whole file's SHA-256 is required and checked.
+	sum := sha256Sum(data)
+	if r.Header.Get("Content-Digest") != "sha-256=:"+base64.StdEncoding.EncodeToString(sum)+":" {
+		m.problem(w, 422, "Content-Digest mismatch")
 		return
 	}
 	if xs := r.Header.Get("X-File-Size"); xs != "" {
@@ -227,14 +277,20 @@ func (m *mockAPI) putPart(w http.ResponseWriter, r *http.Request) {
 		m.problem(w, 400, fmt.Sprintf("Part %d must be exactly %d bytes", n, want))
 		return
 	}
-	data, err := io.ReadAll(r.Body)
+	m.mu.Lock()
+	m.partAttempts[n]++
+	attempt := m.partAttempts[n]
+	m.mu.Unlock()
+	data, err := m.readPart(r, n, attempt, want)
+	if err == errSilent {
+		m.problem(w, http.StatusRequestTimeout, "No data received; send it again")
+		return
+	}
 	if err != nil || int64(len(data)) != want {
 		m.problem(w, 400, "Incomplete part")
 		return
 	}
 	m.mu.Lock()
-	m.partAttempts[n]++
-	attempt := m.partAttempts[n]
 	m.partDigests[n] = r.Header.Get("Content-Digest")
 	hook := m.partHook
 	m.mu.Unlock()
@@ -279,9 +335,7 @@ func (m *mockAPI) complete(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if sess.done {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		w.Write(sess.response)
+		m.answerComplete(w, attempt, sess.response)
 		return
 	}
 	var missing []int
@@ -303,9 +357,27 @@ func (m *mockAPI) complete(w http.ResponseWriter, r *http.Request) {
 	m.blob = buf.Bytes()
 	sess.done = true
 	sess.response = m.uploadResponse(sess.size, r.Header.Get("X-Burn-After-Reading") == "true")
+	m.answerComplete(w, attempt, sess.response)
+}
+
+// answerComplete writes a complete's 201, broken off after its first bytes
+// for the first cutCompletes attempts. The caller holds m.mu.
+func (m *mockAPI) answerComplete(w http.ResponseWriter, attempt int, resp []byte) {
 	w.Header().Set("Content-Type", "application/json")
+	if attempt > m.cutCompletes {
+		w.WriteHeader(http.StatusCreated)
+		w.Write(resp)
+		return
+	}
+	w.Header().Set("Content-Length", strconv.Itoa(len(resp)))
 	w.WriteHeader(http.StatusCreated)
-	w.Write(sess.response)
+	w.Write(resp[:10])
+	w.(http.Flusher).Flush()
+	if hj, ok := w.(http.Hijacker); ok {
+		if conn, _, err := hj.Hijack(); err == nil {
+			conn.Close()
+		}
+	}
 }
 
 func (m *mockAPI) abort(w http.ResponseWriter, r *http.Request) {
@@ -350,9 +422,16 @@ func (m *mockAPI) download(w http.ResponseWriter, r *http.Request) {
 	if rh := r.Header.Get("Range"); rh != "" {
 		m.mu.Lock()
 		m.rangeRequests = append(m.rangeRequests, rh)
-		burn, ignore := m.burn, m.ignoreRange
+		burn, ignore, ticket := m.burn, m.ignoreRange, m.ticket
+		hook, attempt := m.rangeHook, len(m.rangeRequests)
 		m.mu.Unlock()
-		if burn {
+		if hook != nil {
+			if st := hook(attempt); st != 0 {
+				m.problem(w, st, "busy")
+				return
+			}
+		}
+		if burn && (ticket == "" || r.Header.Get("X-Resume-Ticket") != ticket) {
 			m.problem(w, 400, "Byte ranges are not available for one-time files")
 			return
 		}
@@ -368,13 +447,92 @@ func (m *mockAPI) download(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, total-1, total))
 			w.Header().Set("Content-Length", strconv.FormatInt(total-start, 10))
 			w.WriteHeader(http.StatusPartialContent)
+			m.mu.Lock()
+			cut := m.dropRanges > 0 && start+m.dropAfter < total
+			if cut {
+				m.dropRanges--
+			}
+			m.mu.Unlock()
+			if cut {
+				w.Write(blob[start : start+m.dropAfter])
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+				if hj, ok := w.(http.Hijacker); ok {
+					if conn, _, err := hj.Hijack(); err == nil {
+						conn.Close()
+						return
+					}
+				}
+				return
+			}
 			w.Write(blob[start:])
 			return
 		}
 	}
+	m.mu.Lock()
+	m.fullCalls++
+	fullHook, fullAttempt := m.fullHook, m.fullCalls
+	m.mu.Unlock()
+	if fullHook != nil {
+		if st := fullHook(fullAttempt); st != 0 {
+			m.problem(w, st, "storage")
+			return
+		}
+	}
 	w.Header().Set("Content-Type", "application/octet-stream")
+	m.mu.Lock()
+	if m.cutAfterLast && !m.dropped {
+		m.dropped = true
+		m.mu.Unlock()
+		w.WriteHeader(http.StatusOK) // no Content-Length: chunked
+		w.Write(blob)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		if hj, ok := w.(http.Hijacker); ok {
+			if conn, _, err := hj.Hijack(); err == nil {
+				conn.Close() // before the last, empty chunk
+			}
+		}
+		return
+	}
+	m.mu.Unlock()
 	w.Header().Set("Content-Length", strconv.FormatInt(total, 10))
 	m.mu.Lock()
+	if m.burn && m.ticket != "" {
+		t := m.ticket
+		if m.dropped && m.newTicket != "" {
+			t = m.newTicket
+		}
+		w.Header().Set("X-Resume-Ticket", t)
+	}
+	if m.silentAfter > 0 && !m.dropped && m.silentAfter < total {
+		m.dropped = true
+		n := m.silentAfter
+		m.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		w.Write(blob[:n])
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done() // until the client gives up on it
+		return
+	}
+	if m.dropAtStart && !m.dropped {
+		m.dropped = true
+		m.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		if hj, ok := w.(http.Hijacker); ok {
+			if conn, _, err := hj.Hijack(); err == nil {
+				conn.Close()
+			}
+		}
+		return
+	}
 	drop := m.dropAfter > 0 && !m.dropped && m.dropAfter < total
 	if drop {
 		m.dropped = true
@@ -483,4 +641,43 @@ func (m *mockAPI) status(w http.ResponseWriter, r *http.Request) {
 func sha256Sum(b []byte) []byte {
 	s := sha256.Sum256(b)
 	return s[:]
+}
+
+var errSilent = errors.New("part sender went silent")
+
+// readPart reads a part body, slowly when bodyRate is set, and stalls the
+// first attempt of stallPart halfway until the client's request ends.
+func (m *mockAPI) readPart(r *http.Request, n, attempt int, want int64) ([]byte, error) {
+	if m.bodyRate == 0 && m.stallPart == 0 {
+		return io.ReadAll(r.Body)
+	}
+	buf := make([]byte, 0, want)
+	chunk := make([]byte, 4096)
+	for {
+		if n == m.stallPart && attempt == 1 && int64(len(buf)) >= want/2 {
+			// Silent for a while, then dropped as the server drops a
+			// silent part (90 s there): 408, "send it again".
+			time.Sleep(500 * time.Millisecond)
+			return buf, errSilent
+		}
+		k, err := r.Body.Read(chunk)
+		buf = append(buf, chunk[:k]...)
+		if m.bodyRate > 0 && k > 0 {
+			m.rateMu.Lock()
+			now := time.Now()
+			if m.rateNext.Before(now) {
+				m.rateNext = now
+			}
+			m.rateNext = m.rateNext.Add(time.Duration(int64(k) * int64(time.Second) / m.bodyRate))
+			wait := time.Until(m.rateNext)
+			m.rateMu.Unlock()
+			time.Sleep(wait)
+		}
+		if err == io.EOF {
+			return buf, nil
+		}
+		if err != nil {
+			return buf, err
+		}
+	}
 }

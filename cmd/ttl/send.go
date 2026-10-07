@@ -199,12 +199,12 @@ func runSend(args []string) error {
 
 	name := filepath.Base(path)
 	encSize := crypto.EncryptedSize(uint64(info.Size()), name) //nolint:gosec // info.Size() is non-negative file size
-	xferTimeout, err := resolveTimeout(timeoutVal, encSize)
+	xferTimeout, err := resolveTimeout(timeoutVal)
 	if err != nil {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), xferTimeout)
+	ctx, cancel := transferContext(xferTimeout)
 	defer cancel()
 	// Ctrl-C cancels the transfer: an open upload session is handed back
 	// to the server instead of holding a slot until its idle sweep.
@@ -539,23 +539,30 @@ func stripControl(s string) string {
 	}, s)
 }
 
-// Estimates based on 1 Mbps speed plus a 2-minute buffer (minimum 5 minutes).
-func resolveTimeout(flag string, transferBytes int64) (time.Duration, error) {
-	if flag != "" && flag != "auto" {
-		d, err := time.ParseDuration(flag)
-		if err == nil && d > 0 {
-			return d, nil
-		}
-		if jsonMode {
-			return 0, fmt.Errorf("Invalid timeout: %s", flag)
-		}
-		fmt.Fprintf(os.Stderr, "%sWarning:%s Invalid timeout %q, using auto\n", c(cAmber, cBold), c(cReset), flag)
+// resolveTimeout reads --timeout: a limit on the whole transfer, or 0 for
+// none (the default, "auto"). Without one a transfer runs as long as it
+// moves: a stall is resumed, and an upload with no progress for
+// resumeGiveUp or a download that cannot be resumed gives up by itself.
+func resolveTimeout(flag string) (time.Duration, error) {
+	if flag == "" || flag == "auto" {
+		return 0, nil
 	}
-	// 1 Mbps = 125000 bytes/sec
-	seconds := float64(transferBytes) / 125000
-	d := time.Duration(seconds)*time.Second + 2*time.Minute
-	if d < 5*time.Minute {
-		d = 5 * time.Minute
+	d, err := time.ParseDuration(flag)
+	if err == nil && d > 0 {
+		return d, nil
 	}
-	return d, nil
+	if jsonMode {
+		return 0, fmt.Errorf("Invalid timeout: %s", flag)
+	}
+	fmt.Fprintf(os.Stderr, "%sWarning:%s Invalid timeout %q, using none\n", c(cAmber, cBold), c(cReset), flag)
+	return 0, nil
+}
+
+// transferContext is the transfer's context: with the --timeout limit if
+// there is one.
+func transferContext(limit time.Duration) (context.Context, context.CancelFunc) {
+	if limit > 0 {
+		return context.WithTimeout(context.Background(), limit)
+	}
+	return context.WithCancel(context.Background())
 }

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestGet_ResumesAfterConnectionDrop(t *testing.T) {
@@ -78,6 +79,219 @@ func TestGet_Resume_OneTimeFileCannotResume(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(outDir); len(entries) != 0 {
 		t.Fatalf("a failed download must leave no file behind: %v", entries)
+	}
+}
+
+// A one-time file whose first answer carried a resume ticket gets the rest
+// after a drop, with the ticket on the range request only.
+func TestGet_Resume_OneTimeFileWithTicket(t *testing.T) {
+	noKeys(t)
+	m := newMockAPI(t)
+	payload := largePayload(t)
+	src := tempFileBytes(t, "big.bin", payload)
+	if err := runSend([]string{"-p", "resume-pass", "-server", m.URL, src}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	m.dropAfter = 100_000
+	m.burn = true
+	m.ticket = "rt_0123456789abcdefghijklmnopqrstuvwxyzABCDEFG"
+
+	outDir := t.TempDir()
+	if err := runGet([]string{"-p", "resume-pass", "-o", outDir, m.URL + "/aBcDeFgHiJ"}); err != nil {
+		t.Fatalf("a one-time download should resume with its ticket: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(outDir, "big.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("resumed one-time download differs from the original")
+	}
+	if len(m.rangeRequests) != 1 || m.rangeRequests[0] != "bytes=100000-" {
+		t.Fatalf("range requests = %v, want [bytes=100000-]", m.rangeRequests)
+	}
+	if got := m.downloadHeaders.Get("X-Resume-Ticket"); got != m.ticket {
+		t.Fatalf("the resumed request carried ticket %q", got)
+	}
+}
+
+func burnMock(t *testing.T) (*mockAPI, []byte) {
+	t.Helper()
+	noKeys(t)
+	m := newMockAPI(t)
+	payload := largePayload(t)
+	src := tempFileBytes(t, "big.bin", payload)
+	if err := runSend([]string{"-p", "resume-pass", "-server", m.URL, src}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	m.burn = true
+	m.ticket = "rt_0123456789abcdefghijklmnopqrstuvwxyzABCDEFG"
+	return m, payload
+}
+
+func getInto(t *testing.T, m *mockAPI) ([]byte, error) {
+	t.Helper()
+	outDir := t.TempDir()
+	err := runGet([]string{"-p", "resume-pass", "-o", outDir, m.URL + "/aBcDeFgHiJ"})
+	got, _ := os.ReadFile(filepath.Join(outDir, "big.bin"))
+	return got, err
+}
+
+// A busy server during a ticketed resume (503, 429) is asked again: one
+// such answer must not cost a one-time file.
+func TestGet_Resume_OneTimeRetriesBusyServer(t *testing.T) {
+	m, payload := burnMock(t)
+	m.dropAfter = 100_000
+	m.rangeHook = func(attempt int) int {
+		switch attempt {
+		case 1:
+			return 503
+		case 2:
+			return 429
+		}
+		return 0
+	}
+	got, err := getInto(t, m)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("resume through busy answers: err=%v, %d bytes", err, len(got))
+	}
+	if len(m.rangeRequests) != 3 {
+		t.Fatalf("range requests = %d, want 3", len(m.rangeRequests))
+	}
+}
+
+// Every resume that brings bytes starts a new budget: ten breaks in one
+// download, more than maxResumes, still finish.
+func TestGet_Resume_BudgetResetsAfterProgress(t *testing.T) {
+	m, payload := burnMock(t)
+	m.dropAfter = 20_000
+	m.dropRanges = maxResumes + 2
+	got, err := getInto(t, m)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("download with %d breaks: err=%v, %d bytes", m.dropRanges, err, len(got))
+	}
+	if len(m.rangeRequests) <= maxResumes {
+		t.Fatalf("range requests = %d, want more than %d", len(m.rangeRequests), maxResumes)
+	}
+}
+
+// Broken before its first byte: the resume asks from byte 0 with the ticket.
+func TestGet_Resume_OneTimeBrokenBeforeFirstByte(t *testing.T) {
+	m, payload := burnMock(t)
+	m.dropAtStart = true
+	got, err := getInto(t, m)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("err=%v, %d bytes", err, len(got))
+	}
+	if len(m.rangeRequests) != 1 || m.rangeRequests[0] != "bytes=0-" || m.downloadHeaders.Get("X-Resume-Ticket") != m.ticket {
+		t.Fatalf("range requests %v, ticket %q", m.rangeRequests, m.downloadHeaders.Get("X-Resume-Ticket"))
+	}
+}
+
+// The server rolled a download without a byte back and dropped its ticket:
+// the CLI asks once more as a fresh download and takes the new ticket.
+func TestGet_Resume_OneTimeRolledBack(t *testing.T) {
+	m, payload := burnMock(t)
+	m.dropAtStart = true
+	m.rangeHook = func(attempt int) int {
+		if attempt == 1 {
+			return 404
+		}
+		return 0
+	}
+	m.newTicket = "rt_ZYXWVUTSRQPONMLKJIHGFEDCBAzyxwvutsrqponmlkj"
+	got, err := getInto(t, m)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("err=%v, %d bytes", err, len(got))
+	}
+}
+
+// Rolled back, then the fresh downloads keep failing: the file was never
+// used up, so the error must not say it is lost.
+func TestGet_Resume_RolledBackFailureIsNotLoss(t *testing.T) {
+	m, _ := burnMock(t)
+	m.dropAtStart = true
+	m.rangeHook = func(int) int { return 404 }
+	m.fullHook = func(attempt int) int {
+		if attempt == 1 {
+			return 0 // the first answer: headers and a ticket, then nothing
+		}
+		return 502
+	}
+	_, err := getInto(t, m)
+	if err == nil {
+		t.Fatal("expected the download to fail")
+	}
+	if strings.Contains(err.Error(), "cannot be downloaded again") {
+		t.Fatalf("a rolled-back one-time file reported lost: %v", err)
+	}
+}
+
+// Broken before its first byte, then no answer that says more: whether the
+// server rolled the download back is unknown, so the error must not say
+// the file is lost.
+func TestGet_Resume_UnreachableBeforeFirstByteIsNotLoss(t *testing.T) {
+	m, _ := burnMock(t)
+	m.dropAtStart = true
+	m.rangeHook = func(int) int { return 503 }
+	_, err := getInto(t, m)
+	if err == nil {
+		t.Fatal("expected the download to fail")
+	}
+	if strings.Contains(err.Error(), "cannot be downloaded again") {
+		t.Fatalf("a one-time file with no byte received reported lost: %v", err)
+	}
+}
+
+// Every byte arrived, then the stream broke before its end: the file is
+// whole (each chunk is authenticated), so it is kept, not resumed.
+func TestGet_Resume_BreakAfterLastByte(t *testing.T) {
+	m, payload := burnMock(t)
+	m.cutAfterLast = true
+	got, err := getInto(t, m)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("err=%v, %d bytes", err, len(got))
+	}
+	if len(m.rangeRequests) != 0 {
+		t.Fatalf("resumed a complete download: %v", m.rangeRequests)
+	}
+}
+
+// The resume window closed: the error says plainly that the file is gone.
+func TestGet_Resume_OneTimeWindowClosed(t *testing.T) {
+	m, _ := burnMock(t)
+	m.dropAfter = 100_000
+	m.rangeHook = func(int) int { return 404 }
+	_, err := getInto(t, m)
+	if err == nil || !strings.Contains(err.Error(), "cannot be downloaded again") {
+		t.Fatalf("expected the lost-file message, got %v", err)
+	}
+}
+
+// A download whose bytes stop coming while the connection stays open is
+// resumed after downloadIdle from the byte where it stopped.
+func TestGet_Resume_SilentConnection(t *testing.T) {
+	noKeys(t)
+	old := downloadIdle
+	downloadIdle = 300 * time.Millisecond
+	t.Cleanup(func() { downloadIdle = old })
+	m := newMockAPI(t)
+	payload := largePayload(t)
+	src := tempFileBytes(t, "big.bin", payload)
+	if err := runSend([]string{"-p", "resume-pass", "-server", m.URL, src}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	m.silentAfter = 100_000
+	t0 := time.Now()
+	got, err := getInto(t, m)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("err=%v, %d bytes", err, len(got))
+	}
+	if len(m.rangeRequests) != 1 || m.rangeRequests[0] != "bytes=100000-" {
+		t.Fatalf("range requests = %v", m.rangeRequests)
+	}
+	if took := time.Since(t0); took > 10*time.Second {
+		t.Fatalf("took %s", took)
 	}
 }
 

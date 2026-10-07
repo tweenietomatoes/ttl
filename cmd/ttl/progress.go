@@ -4,15 +4,18 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"time"
 
 	"golang.org/x/term"
 )
 
 // progress draws the transfer bar on stderr. Uploads add bytes as the
-// encryptor hands them to the transport and move the counter back when a
-// part is sent again; downloads add bytes as they arrive.
+// encryptor hands them to the transport and take a part's bytes back when
+// it is sent again (two parts may be on the way at once, so every method
+// locks); downloads add bytes as they arrive.
 type progress struct {
+	mu      sync.Mutex
 	n       int64
 	total   int64
 	display int64
@@ -43,6 +46,8 @@ func newProgress(total, displaySize int64, quiet bool) *progress {
 
 // add records n more bytes and redraws at most every 150 ms.
 func (p *progress) add(n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.n += int64(n)
 	if !p.tty || p.done {
 		return
@@ -67,16 +72,33 @@ func (p *progress) add(n int) {
 	}
 }
 
-// set moves the counter to n: a part sent again starts over from its
-// offset, and the speed estimate restarts from there.
+// set moves the counter to n: a single upload sent again starts over from
+// 0, and the speed estimate restarts from there.
 func (p *progress) set(n int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.n = n
 	p.prevN = n
 	p.prevT = time.Time{}
 }
 
+// back takes n bytes off the counter (a part about to be sent again gives
+// back what its last attempt counted), without disturbing the speed
+// estimate of the parts still moving.
+func (p *progress) back(n int64) {
+	if n == 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.n -= n
+	p.prevN -= n
+}
+
 // finish draws the final state and ends the line. Safe to call twice.
 func (p *progress) finish() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.done {
 		return
 	}
@@ -91,6 +113,8 @@ func (p *progress) finish() {
 // note prints msg on its own line (a lost connection, a retry) and redraws
 // the bar under it. Silent in --json mode.
 func (p *progress) note(msg string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.quiet {
 		return
 	}

@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"io"
@@ -12,7 +14,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // largePayload is bigger than the test multipart threshold (256 KiB) and
@@ -147,6 +151,180 @@ func TestUpload_Parts_RetriesPartOn408Stall(t *testing.T) {
 	}
 	if m.partAttempts[1] != 2 {
 		t.Fatalf("part 1 attempts = %d, want 2", m.partAttempts[1])
+	}
+}
+
+// 409: a newer request for the part took over on the server (one the
+// transport retried, say): the part is simply sent again.
+func TestUpload_Parts_RetriesPartOn409Takeover(t *testing.T) {
+	noKeys(t)
+	m := newMockAPI(t)
+	m.partHook = func(n, attempt int) (int, string) {
+		if n == 2 && attempt == 1 {
+			return 409, "A newer request for this part took over; send it again"
+		}
+		return 0, ""
+	}
+	src := tempFileBytes(t, "big.bin", largePayload(t))
+	if err := runSend([]string{"-p", "roundtrip-pass", "-server", m.URL, src}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if m.partAttempts[2] != 2 {
+		t.Fatalf("part 2 attempts = %d, want 2", m.partAttempts[2])
+	}
+}
+
+// The next part goes up while the server is still storing the last one:
+// "storing" part 1 here lasts until part 2 has arrived.
+func TestUpload_Parts_NextPartGoesUpWhileOneIsStored(t *testing.T) {
+	noKeys(t)
+	m := newMockAPI(t)
+	second := make(chan struct{})
+	var overlapped atomic.Bool
+	m.partHook = func(n, attempt int) (int, string) {
+		switch {
+		case n == 1:
+			select {
+			case <-second:
+				overlapped.Store(true)
+			case <-time.After(3 * time.Second):
+			}
+		case n == 2 && attempt == 1:
+			close(second)
+		}
+		return 0, ""
+	}
+	payload := largePayload(t)
+	src := tempFileBytes(t, "big.bin", payload)
+	if got := sendAndGet(t, m, src); !bytes.Equal(got, payload) {
+		t.Fatal("content differs")
+	}
+	if !overlapped.Load() {
+		t.Fatal("part 2 did not go up while part 1 was being stored")
+	}
+}
+
+// A part refused for good stops the upload while another part is still on
+// the way: no complete, the session handed back, nothing left hanging.
+func TestUpload_Parts_FinalRefusalStopsTheOtherPart(t *testing.T) {
+	noKeys(t)
+	m := newMockAPI(t)
+	m.partHook = func(n, attempt int) (int, string) {
+		switch n {
+		case 1:
+			time.Sleep(300 * time.Millisecond) // still being stored when part 2 is refused
+		case 2:
+			return 413, "Storage quota exceeded (500 GB limit)"
+		}
+		return 0, ""
+	}
+	src := tempFileBytes(t, "big.bin", largePayload(t))
+	done := make(chan error, 1)
+	go func() { done <- runSend([]string{"-p", "roundtrip-pass", "-server", m.URL, src}) }()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the upload hung after a refused part")
+	}
+	if err == nil || !strings.Contains(err.Error(), "quota") {
+		t.Fatalf("expected the quota refusal, got %v", err)
+	}
+	if m.completeCalls != 0 {
+		t.Fatal("completed after a refused part")
+	}
+	if m.abortCalls != 1 {
+		t.Fatalf("session aborts = %d, want 1", m.abortCalls)
+	}
+	if m.partAttempts[4] != 0 || m.partAttempts[5] != 0 {
+		t.Fatalf("parts after the refusal were sent: %v", m.partAttempts)
+	}
+}
+
+func setPartWatch(t *testing.T, idle, reply time.Duration) {
+	t.Helper()
+	oldIdle, oldReply := partIdle, partReply
+	partIdle, partReply = idle, reply
+	t.Cleanup(func() { partIdle, partReply = oldIdle, oldReply })
+}
+
+// Two parts sharing a slow link take far longer than the idle limit, but
+// their bytes keep moving, so neither is cut; nor is the wait for the
+// server's answer once a whole part is sent.
+func TestUpload_Parts_SlowSharedLinkStillLands(t *testing.T) {
+	noKeys(t)
+	setPartWatch(t, 300*time.Millisecond, 3*time.Second)
+	m := newMockAPI(t)
+	m.bodyRate = 100 << 10 // two 64 KiB parts at once: about 1.3 s each
+	m.partHook = func(n, attempt int) (int, string) {
+		time.Sleep(500 * time.Millisecond) // storing, after the whole body arrived
+		return 0, ""
+	}
+	payload := largePayload(t)
+	src := tempFileBytes(t, "big.bin", payload)
+	if got := sendAndGet(t, m, src); !bytes.Equal(got, payload) {
+		t.Fatal("content differs")
+	}
+	for n, a := range m.partAttempts {
+		if a != 1 {
+			t.Fatalf("part %d took %d attempts on a slow but moving link", n, a)
+		}
+	}
+}
+
+// A part the server drops for silence (408) is sent again, and the rest go
+// one at a time.
+func TestUpload_Parts_SilentPartResent(t *testing.T) {
+	noKeys(t)
+	m := newMockAPI(t)
+	m.stallPart = 2
+	payload := largePayload(t)
+	src := tempFileBytes(t, "big.bin", payload)
+	if got := sendAndGet(t, m, src); !bytes.Equal(got, payload) {
+		t.Fatal("content differs")
+	}
+	if m.partAttempts[2] != 2 {
+		t.Fatalf("part 2 attempts = %d, want 2", m.partAttempts[2])
+	}
+}
+
+// The attempt watch cuts only an attempt whose bytes stopped moving, or one
+// whose answer is overdue after all of it went out.
+func TestWatchAttempt_CutsOnlyIdleAttempts(t *testing.T) {
+	setPartWatch(t, 200*time.Millisecond, 600*time.Millisecond)
+	var lastWhy string
+	run := func(advance func(c *atomic.Int64)) (cut bool, after time.Duration) {
+		var counted atomic.Int64
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		why, stop := watchAttempt(&counted, 1000, cancel)
+		defer stop()
+		t0 := time.Now()
+		go advance(&counted)
+		select {
+		case <-ctx.Done():
+			lastWhy = why()
+			return lastWhy != "", time.Since(t0)
+		case <-time.After(1500 * time.Millisecond):
+			return false, time.Since(t0)
+		}
+	}
+	// Moving slowly (a byte every 50 ms) for 1.5 s: never cut.
+	if cut, _ := run(func(c *atomic.Int64) {
+		for i := 0; i < 30; i++ {
+			time.Sleep(50 * time.Millisecond)
+			c.Add(1)
+		}
+	}); cut {
+		t.Fatal("a slow but moving attempt was cut")
+	}
+	// Stuck halfway: cut after about partIdle.
+	if cut, after := run(func(c *atomic.Int64) { c.Store(500) }); !cut || after > time.Second || !strings.Contains(lastWhy, "no data moved") {
+		t.Fatalf("a stuck attempt: cut=%v after %s (%q)", cut, after, lastWhy)
+	}
+	// All sent, answer pending: waits partReply, not partIdle, and says so.
+	if cut, after := run(func(c *atomic.Int64) { c.Store(1000) }); !cut || after < 500*time.Millisecond || !strings.Contains(lastWhy, "no answer") {
+		t.Fatalf("an attempt waiting for its answer: cut=%v after %s (%q)", cut, after, lastWhy)
 	}
 }
 
@@ -288,44 +466,242 @@ func TestUpload_Parts_CompleteMissingPartsIsFinal(t *testing.T) {
 	}
 }
 
-func TestUpload_NoSessions_FallsBackToSinglePUT(t *testing.T) {
+// A complete answer cut off on the way is asked for again: the server
+// answers a repeated complete with the same link.
+func TestUpload_Parts_CompleteCutAnswerAskedAgain(t *testing.T) {
 	noKeys(t)
 	m := newMockAPI(t)
-	m.noSessions = true
+	m.cutCompletes = 1
 	payload := largePayload(t)
 	src := tempFileBytes(t, "big.bin", payload)
 	if got := sendAndGet(t, m, src); !bytes.Equal(got, payload) {
 		t.Fatal("content differs")
 	}
-	if m.sessionCalls != 1 || m.putCalls != 1 {
-		t.Fatalf("sessions=%d puts=%d, want 1/1", m.sessionCalls, m.putCalls)
+	if m.completeCalls != 2 {
+		t.Fatalf("complete calls = %d, want 2", m.completeCalls)
 	}
 }
 
-func TestUpload_Small_UsesSinglePUT(t *testing.T) {
+// An answer that keeps breaking off is given up on after cutRetries more
+// tries, saying that the file may be stored.
+func TestUpload_Parts_CompleteAnswerKeptBreakingOff(t *testing.T) {
+	noKeys(t)
+	m := newMockAPI(t)
+	m.cutCompletes = 1 << 20
+	src := tempFileBytes(t, "big.bin", largePayload(t))
+	err := runSend([]string{"-p", "roundtrip-pass", "-server", m.URL, src})
+	if err == nil || !strings.Contains(err.Error(), "may be stored") {
+		t.Fatalf("expected the lost-answer error, got %v", err)
+	}
+	if m.completeCalls != cutRetries+1 {
+		t.Fatalf("complete calls = %d, want %d", m.completeCalls, cutRetries+1)
+	}
+}
+
+// A whole answer that cannot be read is final: asking again gets the same.
+func TestUpload_Parts_CompleteMalformedAnswerIsFinal(t *testing.T) {
+	noKeys(t)
+	m := newMockAPI(t)
+	m.completeHook = func(attempt int) (int, string) {
+		return 201, `{"link":12345}`
+	}
+	src := tempFileBytes(t, "big.bin", largePayload(t))
+	err := runSend([]string{"-p", "roundtrip-pass", "-server", m.URL, src})
+	if err == nil || !strings.Contains(err.Error(), "Invalid server response") {
+		t.Fatalf("expected an invalid-response error, got %v", err)
+	}
+	if m.completeCalls != 1 {
+		t.Fatalf("complete calls = %d, want 1", m.completeCalls)
+	}
+}
+
+// A server without sessions takes only files of one part: a larger one is
+// refused with its reason, not sent some other way.
+func TestUpload_NoSessions_LargeFileRefused(t *testing.T) {
+	noKeys(t)
+	m := newMockAPI(t)
+	m.noSessions = true
+	src := tempFileBytes(t, "big.bin", largePayload(t))
+	err := runSend([]string{"-p", "roundtrip-pass", "-server", m.URL, src})
+	if err == nil || !strings.Contains(err.Error(), "Resumable uploads are not available") {
+		t.Fatalf("expected the server's reason, got %v", err)
+	}
+	if m.sessionCalls != 1 || m.putCalls != 0 {
+		t.Fatalf("sessions=%d puts=%d, want 1/0", m.sessionCalls, m.putCalls)
+	}
+}
+
+// Over the single-request size (lowered here), even a tiny file goes in a
+// verified part of a session.
+func TestUpload_Small_PartsWhenOverTheSingleSize(t *testing.T) {
+	noKeys(t)
+	old := singleMaxBytes
+	singleMaxBytes = 0
+	t.Cleanup(func() { singleMaxBytes = old })
+	m := newMockAPI(t)
+	payload := []byte("small enough for one request")
+	src := tempFileBytes(t, "small.txt", payload)
+	if got := sendAndGet(t, m, src, "-b"); !bytes.Equal(got, payload) {
+		t.Fatal("content differs")
+	}
+	if m.sessionCalls != 1 || m.putCalls != 0 {
+		t.Fatalf("sessions=%d puts=%d, want 1/0", m.sessionCalls, m.putCalls)
+	}
+	if len(m.partDigests) != 1 || m.partDigests[1] == "" {
+		t.Fatalf("part digests = %v, want one for part 1", m.partDigests)
+	}
+	if h := m.lastUploadHeaders; h.Get("X-Burn-After-Reading") != "true" || h.Get("X-File-Size") != strconv.Itoa(len(m.blob)) {
+		t.Fatalf("session headers: burn=%q size=%q", h.Get("X-Burn-After-Reading"), h.Get("X-File-Size"))
+	}
+}
+
+// The default for a file of one part: a single PUT /v1/files with the
+// whole file's SHA-256, which the server checks before it stores it.
+func TestUpload_Small_GoesInOneRequest(t *testing.T) {
 	noKeys(t)
 	m := newMockAPI(t)
 	payload := []byte("small enough for one request")
 	src := tempFileBytes(t, "small.txt", payload)
-	if got := sendAndGet(t, m, src); !bytes.Equal(got, payload) {
+	if got := sendAndGet(t, m, src, "-b"); !bytes.Equal(got, payload) {
 		t.Fatal("content differs")
 	}
 	if m.sessionCalls != 0 || m.putCalls != 1 {
 		t.Fatalf("sessions=%d puts=%d, want 0/1", m.sessionCalls, m.putCalls)
 	}
 	h := m.lastUploadHeaders
+	sum := sha256.Sum256(m.blob)
+	if got := h.Get("Content-Digest"); got != "sha-256=:"+base64.StdEncoding.EncodeToString(sum[:])+":" {
+		t.Fatalf("Content-Digest = %q", got)
+	}
 	if got := h.Get("X-File-Size"); got != strconv.Itoa(len(m.blob)) {
 		t.Fatalf("X-File-Size = %q, want %d", got, len(m.blob))
 	}
-	if h.Get("X-Upload-Path") != "stream" {
-		t.Fatalf("X-Upload-Path = %q", h.Get("X-Upload-Path"))
+	if h.Get("X-Burn-After-Reading") != "true" || h.Get("X-Token-Hash") == "" {
+		t.Fatalf("headers: burn=%q token hash=%q", h.Get("X-Burn-After-Reading"), h.Get("X-Token-Hash"))
 	}
 	if ua := h.Get("User-Agent"); !strings.HasPrefix(ua, "ttl-cli/") {
 		t.Fatalf("User-Agent = %q", ua)
 	}
 }
 
-func TestUpload_Whole_RetriesAfterConnectionDrop(t *testing.T) {
+// Bytes altered on the way (422) are sent again at once; a busy or failing
+// server (429, 503) is asked again after a pause.
+func TestUpload_Single_RetriesLikeAPart(t *testing.T) {
+	for _, status := range []int{422, 429, 503, 408, 409} {
+		noKeys(t)
+		m := newMockAPI(t)
+		m.fileHook = func(attempt int) (int, string) {
+			if attempt == 1 {
+				return status, "once"
+			}
+			return 0, ""
+		}
+		src := tempFileBytes(t, "small.txt", []byte("retry me"))
+		if got := sendAndGet(t, m, src); string(got) != "retry me" {
+			t.Fatalf("%d: content differs", status)
+		}
+		if m.putCalls != 2 {
+			t.Fatalf("%d: PUT attempts = %d, want 2", status, m.putCalls)
+		}
+	}
+}
+
+// An answer cut off on the way is asked for again: the server gives the
+// same bytes the same answer.
+func TestUpload_Single_CutOffAnswerAskedAgain(t *testing.T) {
+	noKeys(t)
+	var puts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/limits" {
+			writeMockLimits(w)
+			return
+		}
+		io.Copy(io.Discard, r.Body)
+		puts++
+		w.Header().Set("Content-Length", "200")
+		w.WriteHeader(http.StatusCreated)
+		if puts == 1 {
+			w.Write([]byte(`{"link":"https://ttl.space/aB`)) // then the connection goes
+			if hj, ok := w.(http.Hijacker); ok {
+				if conn, _, err := hj.Hijack(); err == nil {
+					conn.Close()
+				}
+			}
+			return
+		}
+		b, _ := json.Marshal(map[string]any{"link": "https://ttl.space/aBcDeFgHiJ", "token": "aBcDeFgHiJ", "manage_key": mockManageKey})
+		w.Write(append(b, bytes.Repeat([]byte(" "), 200-len(b))...))
+	}))
+	defer srv.Close()
+	src := tempFile(t, "x.txt", "answer lost")
+	if err := runSend([]string{"-p", "12345678", "-server", srv.URL, src}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if puts != 2 {
+		t.Fatalf("PUT attempts = %d, want 2", puts)
+	}
+}
+
+// An answer that keeps breaking off is given up on after cutRetries more
+// tries, saying that the file may be stored.
+func TestUpload_Single_AnswerKeptBreakingOff(t *testing.T) {
+	noKeys(t)
+	var puts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/limits" {
+			writeMockLimits(w)
+			return
+		}
+		io.Copy(io.Discard, r.Body)
+		puts.Add(1)
+		w.Header().Set("Content-Length", "200")
+		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte(`{"link":"https://ttl.space/aB`))
+		w.(http.Flusher).Flush()
+		if hj, ok := w.(http.Hijacker); ok {
+			if conn, _, err := hj.Hijack(); err == nil {
+				conn.Close()
+			}
+		}
+	}))
+	defer srv.Close()
+	src := tempFile(t, "x.txt", "answer lost")
+	err := runSend([]string{"-p", "12345678", "-server", srv.URL, src})
+	if err == nil || !strings.Contains(err.Error(), "may be stored") {
+		t.Fatalf("expected the lost-answer error, got %v", err)
+	}
+	if puts.Load() != cutRetries+1 {
+		t.Fatalf("PUT attempts = %d, want %d", puts.Load(), cutRetries+1)
+	}
+}
+
+// A daily-limit 429 is final at once: waiting cannot lift it.
+func TestUpload_Single_QuotaRefusalIsFinal(t *testing.T) {
+	noKeys(t)
+	var puts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/limits" {
+			writeMockLimits(w)
+			return
+		}
+		io.Copy(io.Discard, r.Body)
+		puts++
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"detail":"Upload limit reached (10 per day)"}`))
+	}))
+	defer srv.Close()
+	src := tempFile(t, "x.txt", "over the limit")
+	err := runSend([]string{"-p", "12345678", "-server", srv.URL, src})
+	if err == nil || !strings.Contains(err.Error(), "Upload limit reached") {
+		t.Fatalf("err = %v, want the server's limit message", err)
+	}
+	if puts != 1 {
+		t.Fatalf("PUT attempts = %d, want 1", puts)
+	}
+}
+
+func TestUpload_Single_RetriesAfterConnectionDrop(t *testing.T) {
 	noKeys(t)
 	var puts int
 	var stored []byte
@@ -361,15 +737,20 @@ func TestUpload_Whole_RetriesAfterConnectionDrop(t *testing.T) {
 	}
 }
 
-func TestUpload_Whole_GivesUpAfterAttempts(t *testing.T) {
+// A connection that never lets the file through ends the upload once
+// nothing has got further for resumeGiveUp.
+func TestUpload_Single_GivesUpWithoutProgress(t *testing.T) {
 	noKeys(t)
-	var puts int
+	old := resumeGiveUp
+	resumeGiveUp = 300 * time.Millisecond
+	t.Cleanup(func() { resumeGiveUp = old })
+	var puts atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/limits" {
 			writeMockLimits(w)
 			return
 		}
-		puts++
+		puts.Add(1)
 		if hj, ok := w.(http.Hijacker); ok {
 			conn, _, _ := hj.Hijack()
 			conn.Close()
@@ -379,15 +760,78 @@ func TestUpload_Whole_GivesUpAfterAttempts(t *testing.T) {
 
 	src := tempFile(t, "x.txt", "never lands")
 	err := runSend([]string{"-p", "12345678", "-server", srv.URL, src})
-	if err == nil || !strings.Contains(err.Error(), "Upload failed") {
-		t.Fatalf("expected Upload failed, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "no progress") {
+		t.Fatalf("expected no progress, got %v", err)
 	}
-	if puts != wholeAttempts {
-		t.Fatalf("PUT attempts = %d, want %d", puts, wholeAttempts)
+	if puts.Load() < 2 {
+		t.Fatalf("PUT attempts = %d, want retries before giving up", puts.Load())
 	}
 }
 
-func TestUpload_Whole_ServerRefusalIsNotRetried(t *testing.T) {
+// slowUplink sends request bodies at rate bytes per second, as a slow
+// link does: the CLI sees its bytes leave little by little.
+type slowUplink struct{ rate int64 }
+
+func (s slowUplink) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Body != nil && req.Body != http.NoBody {
+		req = req.Clone(req.Context())
+		req.Body = io.NopCloser(&rateReader{ctx: req.Context(), r: req.Body, rate: s.rate})
+	}
+	return http.DefaultTransport.RoundTrip(req)
+}
+
+type rateReader struct {
+	ctx  context.Context
+	r    io.Reader
+	rate int64
+	next time.Time
+}
+
+func (s *rateReader) Read(p []byte) (int, error) {
+	if len(p) > 4096 {
+		p = p[:4096]
+	}
+	if d := time.Until(s.next); d > 0 {
+		select {
+		case <-time.After(d):
+		case <-s.ctx.Done():
+			return 0, s.ctx.Err()
+		}
+	}
+	if s.next.IsZero() {
+		s.next = time.Now()
+	}
+	n, err := s.r.Read(p)
+	s.next = s.next.Add(time.Duration(int64(n) * int64(time.Second) / s.rate))
+	return n, err
+}
+
+// A part that moves slowly for longer than resumeGiveUp and then fails
+// once is sent again: its bytes going further than ever was progress.
+func TestUpload_Parts_SlowPartThenErrorIsRetried(t *testing.T) {
+	noKeys(t)
+	old := resumeGiveUp
+	resumeGiveUp = 300 * time.Millisecond
+	testTransport = slowUplink{rate: 64 << 10} // a 64 KiB part: about a second
+	t.Cleanup(func() { resumeGiveUp, testTransport = old, nil })
+	m := newMockAPI(t)
+	m.partHook = func(n, attempt int) (int, string) {
+		if n == 1 && attempt == 1 {
+			return 503, "transient"
+		}
+		return 0, ""
+	}
+	payload := largePayload(t)
+	src := tempFileBytes(t, "big.bin", payload)
+	if got := sendAndGet(t, m, src); !bytes.Equal(got, payload) {
+		t.Fatal("content differs")
+	}
+	if m.partAttempts[1] != 2 {
+		t.Fatalf("part 1 attempts = %d, want 2", m.partAttempts[1])
+	}
+}
+
+func TestUpload_Single_ServerRefusalIsNotRetried(t *testing.T) {
 	noKeys(t)
 	var puts int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -532,7 +976,15 @@ func TestSend_FileShrinkingDuringUploadFails(t *testing.T) {
 
 func TestFallbackToTCP_SwitchesClient(t *testing.T) {
 	h := &httpConn{client: newH3Client(), h3: true}
-	h.fallbackToTCP()
+	failed := h.client
+	h.fallbackToTCP(failed)
+	tcp := h.client
+	// A second request that failed on the same HTTP/3 client meanwhile
+	// (two parts on the way) leaves the switch as it is.
+	h.fallbackToTCP(failed)
+	if h.client != tcp {
+		t.Fatal("a second fallback replaced the TCP client again")
+	}
 	if h.h3 {
 		t.Fatal("still marked as HTTP/3")
 	}

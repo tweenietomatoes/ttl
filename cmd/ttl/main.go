@@ -8,11 +8,26 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"regexp"
+	"runtime/debug"
 	"strings"
 )
 
-// version is set at build time by goreleaser via ldflags.
+// version is set at build time by goreleaser via ldflags; a `go install
+// …@vX.Y.Z` build has it in its build info instead.
 var version = "dev"
+
+var releaseTag = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+$`)
+
+func init() {
+	if version != "dev" {
+		return
+	}
+	// Only a release tag (vX.Y.Z): a local build's pseudo-version stays "dev".
+	if bi, ok := debug.ReadBuildInfo(); ok && releaseTag.MatchString(bi.Main.Version) {
+		version = strings.TrimPrefix(bi.Main.Version, "v")
+	}
+}
 
 var jsonMode bool // set by the --json flag
 
@@ -162,7 +177,7 @@ const usageText = `{T}ttl.space{R} {D}— Encrypted file transfer. Ephemeral by 
   {F}-n, --limit N{R}          {D}List at most N files (default: all){R}
   {F}--server URL{R}           {D}Server to talk to (default: https://ttl.space){R}
   {F}--json{R}                 {D}Output JSON to stdout (for scripts and AI agents){R}
-  {F}--timeout D{R}            {D}Transfer timeout (e.g. 5m, 1h). Default: auto (assumes 1 Mbps){R}
+  {F}--timeout D{R}            {D}Give up after D (e.g. 30m, 2h). Default: none, a stalled transfer resumes{R}
   {F}--password-stdin{R}       {D}Read password from stdin (for scripts){R}
   {F}--password-file F{R}      {D}Read password from file (for scripts){R}
   {F}-h3, --http3{R}           {D}Try HTTP/3 (QUIC) first, fall back to TCP if unavailable{R}
@@ -179,8 +194,8 @@ const usageText = `{T}ttl.space{R} {D}— Encrypted file transfer. Ephemeral by 
 {B}Orbit key:{R} {D}Auto-detected from TTL_API_KEY env, ttl.key next to binary, or ~/.ttl/key.{R}
   {D}Passed automatically on get/probe so private (uploader-only) files open transparently.{R}
 
-{B}Transfers:{R} {D}Large uploads go in resumable parts and interrupted downloads resume,{R}
-  {D}so a dropped connection continues where it stopped. Ctrl-C cancels cleanly.{R}
+{B}Transfers:{R} {D}A failed upload request is sent again (files over 16 MiB go in resumable{R}
+  {D}parts) and interrupted downloads resume, one-time ones too. Ctrl-C cancels cleanly.{R}
 
 {B}Download:{R} You can pass a full URL or just the 10-character token.
   {C}ttl get aBcDeFgHiJ{R}  is the same as  {C}ttl get{R} {U}https://ttl.space/aBcDeFgHiJ{R}

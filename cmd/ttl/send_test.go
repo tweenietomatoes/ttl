@@ -382,93 +382,53 @@ func TestCLI_Send_DanglingSymlink(t *testing.T) {
 // --- resolveTimeout ---
 
 func TestResolveTimeout_Custom(t *testing.T) {
-	d, err := resolveTimeout("5m", 1000)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if d != 5*time.Minute {
-		t.Fatalf("expected 5m, got %v", d)
-	}
-}
-
-func TestResolveTimeout_CustomHour(t *testing.T) {
-	d, err := resolveTimeout("1h", 1000)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if d != time.Hour {
-		t.Fatalf("expected 1h, got %v", d)
+	for flag, want := range map[string]time.Duration{"5m": 5 * time.Minute, "1h": time.Hour, "90s": 90 * time.Second} {
+		d, err := resolveTimeout(flag)
+		if err != nil || d != want {
+			t.Fatalf("%s: %v %v, want %v", flag, d, err, want)
+		}
 	}
 }
 
-func TestResolveTimeout_Auto_Empty(t *testing.T) {
-	d, err := resolveTimeout("", 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if d < 5*time.Minute {
-		t.Fatalf("auto minimum should be 5m, got %v", d)
-	}
-}
-
-func TestResolveTimeout_Auto_Keyword(t *testing.T) {
-	d, err := resolveTimeout("auto", 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if d < 5*time.Minute {
-		t.Fatalf("auto minimum should be 5m, got %v", d)
+// No limit unless one is asked for: a slow transfer that keeps moving is
+// never cut short.
+func TestResolveTimeout_NoneByDefault(t *testing.T) {
+	for _, flag := range []string{"", "auto"} {
+		d, err := resolveTimeout(flag)
+		if err != nil || d != 0 {
+			t.Fatalf("%q: %v %v, want no limit", flag, d, err)
+		}
 	}
 }
 
-func TestResolveTimeout_Auto_LargeFile(t *testing.T) {
-	// 100 MB at 1 Mbps = ~838 s + 120 s buffer = ~16 min.
-	d, err := resolveTimeout("", 100*1024*1024)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if d < 15*time.Minute {
-		t.Fatalf("100 MB file should have timeout > 15m, got %v", d)
-	}
-}
-
+// Non-JSON mode: an invalid value warns and means no limit.
 func TestResolveTimeout_Invalid(t *testing.T) {
-	// Non-JSON mode: falls back to auto with warning
-	d, err := resolveTimeout("notaduration", 1000)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if d < 5*time.Minute {
-		t.Fatalf("invalid value should fall back to auto (min 5m), got %v", d)
+	for _, flag := range []string{"notaduration", "-5m", "0s"} {
+		d, err := resolveTimeout(flag)
+		if err != nil || d != 0 {
+			t.Fatalf("%q: %v %v, want no limit", flag, d, err)
+		}
 	}
 }
 
 func TestResolveTimeout_Invalid_JSON(t *testing.T) {
 	jsonMode = true
 	defer func() { jsonMode = false }()
-	_, err := resolveTimeout("notaduration", 1000)
-	if err == nil {
+	if _, err := resolveTimeout("notaduration"); err == nil {
 		t.Fatal("expected error for invalid timeout in JSON mode")
 	}
 }
 
-func TestResolveTimeout_Negative(t *testing.T) {
-	d, err := resolveTimeout("-5m", 1000)
-	if err != nil {
-		t.Fatal(err)
+func TestTransferContext(t *testing.T) {
+	ctx, cancel := transferContext(0)
+	defer cancel()
+	if _, ok := ctx.Deadline(); ok {
+		t.Fatal("no limit should mean no deadline")
 	}
-	if d < 5*time.Minute {
-		t.Fatalf("negative value should fall back to auto, got %v", d)
-	}
-}
-
-func TestResolveTimeout_Zero(t *testing.T) {
-	d, err := resolveTimeout("0s", 1000)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if d < 5*time.Minute {
-		t.Fatalf("zero value should fall back to auto, got %v", d)
+	ctx2, cancel2 := transferContext(time.Minute)
+	defer cancel2()
+	if dl, ok := ctx2.Deadline(); !ok || time.Until(dl) > time.Minute {
+		t.Fatalf("1m limit: deadline %v %v", dl, ok)
 	}
 }
 

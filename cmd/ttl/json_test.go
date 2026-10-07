@@ -770,3 +770,43 @@ func TestJSON_Send_SizeIsNumber(t *testing.T) {
 		t.Errorf("size should be a number, got %T: %v", result["size"], result["size"])
 	}
 }
+
+// The JSON result of a send through the parts path, as for files over
+// 16 MiB: same fields as the single PUT.
+func TestJSON_Send_PartsPath(t *testing.T) {
+	noKeys(t)
+	old := singleMaxBytes
+	singleMaxBytes = 0
+	t.Cleanup(func() { singleMaxBytes = old })
+	m := newMockAPI(t)
+	f := tempFile(t, "report.csv", "id,name\n1,alice\n2,bob\n")
+
+	oldJSON := jsonMode
+	jsonMode = true
+	defer func() { jsonMode = oldJSON }()
+	r, w, _ := os.Pipe()
+	origStdout := os.Stdout
+	os.Stdout = w
+	err := runSend([]string{"-p", "securepass1", "-t", "1h", "-b", "-server", m.URL, f})
+	w.Close()
+	os.Stdout = origStdout
+	out, _ := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if m.sessionCalls != 1 || m.putCalls != 0 {
+		t.Fatalf("sessions=%d puts=%d, want the parts path", m.sessionCalls, m.putCalls)
+	}
+	var res map[string]any
+	if err := json.Unmarshal(out, &res); err != nil {
+		t.Fatalf("not JSON: %q", out)
+	}
+	for _, k := range []string{"ok", "link", "token", "manage_key", "burn", "ttl", "expires_in"} {
+		if _, ok := res[k]; !ok {
+			t.Fatalf("JSON lacks %q: %s", k, out)
+		}
+	}
+	if res["ok"] != true || res["burn"] != true || res["ttl"] != "1h" {
+		t.Fatalf("JSON values: %s", out)
+	}
+}

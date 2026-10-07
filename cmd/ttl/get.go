@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -154,11 +155,11 @@ func runGet(args []string) error {
 
 	// --- download: full file, authenticated with bearer token ---
 	encTotal := crypto.EncryptedSize(probeFileSize, probeFilename)
-	xferTimeout, err := resolveTimeout(timeoutVal, encTotal)
+	xferTimeout, err := resolveTimeout(timeoutVal)
 	if err != nil {
 		return err
 	}
-	dlCtx, dlCancel := context.WithTimeout(context.Background(), xferTimeout)
+	dlCtx, dlCancel := transferContext(xferTimeout)
 	defer dlCancel()
 	// Ctrl-C ends the download cleanly: the partial file is removed.
 	dlCtx, stop := signal.NotifyContext(dlCtx, os.Interrupt, syscall.SIGTERM)
@@ -168,7 +169,12 @@ func runGet(args []string) error {
 	if err != nil {
 		return fmt.Errorf("Invalid URL: %w", err)
 	}
-	open := func(ctx context.Context, from int64) (*http.Response, error) {
+	// A one-time file is used up the moment its download starts. The answer
+	// then carries a resume ticket: only with it does the server hand out
+	// the rest after a broken connection (for a few minutes). It stays in
+	// memory, never printed or stored. With a ticket every request after the
+	// first is a range, from byte 0 too.
+	open := func(ctx context.Context, from int64, ticket string) (*http.Response, error) {
 		req, reqErr := newRequest(ctx, http.MethodGet, downloadURL, nil)
 		if reqErr != nil {
 			return nil, reqErr
@@ -176,13 +182,16 @@ func runGet(args []string) error {
 		req.Header.Set("X-Download-Token", tokenHex)
 		req.Header.Set("X-Confirm-Burn", "true")
 		setAPIKeyHeader(req.Header, apiKey)
-		if from > 0 {
+		if from > 0 || ticket != "" {
 			req.Header.Set("Range", "bytes="+strconv.FormatInt(from, 10)+"-")
+		}
+		if ticket != "" {
+			req.Header.Set("X-Resume-Ticket", ticket)
 		}
 		return hc.do(req)
 	}
 
-	resp, err := open(dlCtx, 0)
+	resp, err := open(dlCtx, 0, "")
 	if err != nil {
 		return fmt.Errorf("Download failed: %w", err)
 	}
@@ -192,7 +201,8 @@ func runGet(args []string) error {
 	}
 
 	prog := newProgress(encTotal, int64(probeFileSize), jsonMode) //nolint:gosec // file size is capped at 1 TB by parseMetadata, fits int64
-	body := &resumingBody{ctx: dlCtx, open: open, body: resp.Body, total: encTotal, prog: prog}
+	ticket := resp.Header.Get("X-Resume-Ticket")
+	body := &resumingBody{ctx: dlCtx, open: open, body: resp.Body, total: encTotal, prog: prog, ticket: ticket, oneTime: ticket != ""}
 	defer func() { _ = body.Close() }()
 	origName, filename, written, err := crypto.DecryptStreamWithKey(prog.reader(body), encKey, outputDir)
 	prog.finish()
@@ -233,22 +243,32 @@ func runGet(args []string) error {
 
 const maxResumes = 8
 
+// downloadIdle: a download read that brings no byte for this long is taken
+// for a connection that died silently; the body is closed and the rest is
+// asked for from the same byte. Only a read waiting for the network is
+// timed. A variable for tests.
+var downloadIdle = time.Minute
+
 // resumingBody reads a download and, when the connection breaks before
 // all total bytes arrived, asks the server for the rest with a Range
 // request and carries on where it stopped. Every 64 KiB chunk is its own
 // authenticated block, so the decryptor sees one continuous stream. A
 // server that ignores Range (200) has the bytes already received skipped.
-// One-time files cannot be resumed: the server refuses ranges for them.
+// A one-time file resumes only with the ticket its first answer carried
+// (see open in runGet); an older server refuses ranges for it.
 type resumingBody struct {
-	ctx     context.Context
-	open    func(ctx context.Context, from int64) (*http.Response, error)
-	body    io.ReadCloser
-	off     int64 // bytes delivered so far
-	total   int64 // bytes expected on the wire
-	tries   int
-	broken  error // a body error still to be handled on the next Read
-	failure error // why resuming was given up
-	prog    *progress
+	ctx       context.Context
+	open      func(ctx context.Context, from int64, ticket string) (*http.Response, error)
+	body      io.ReadCloser
+	off       int64 // bytes delivered so far
+	total     int64 // bytes expected on the wire
+	tries     int   // attempts since bytes last arrived
+	resumedAt int64 // off at the last resume
+	ticket    string
+	oneTime   bool  // a ticket was seen: a failure loses the file for good
+	broken    error // a body error still to be handled on the next Read
+	failure   error // why resuming was given up
+	prog      *progress
 }
 
 func (b *resumingBody) Read(p []byte) (int, error) {
@@ -260,10 +280,16 @@ func (b *resumingBody) Read(p []byte) (int, error) {
 		}
 	}
 	for {
-		n, err := b.body.Read(p)
+		n, err := b.readIdle(p)
 		b.off += int64(n)
-		if err == nil || (errors.Is(err, io.EOF) && b.off >= b.total) {
-			return n, err
+		if err == nil {
+			return n, nil
+		}
+		// Everything expected has arrived: whatever broke after the last byte
+		// (a stream reset before its end flag) does not matter, since the
+		// decryptor checks every chunk, the last one included.
+		if b.off >= b.total {
+			return n, io.EOF
 		}
 		// The body ended early: a broken connection, or a clean end short
 		// of the size. Hand over what arrived first; resume on the next call.
@@ -277,12 +303,23 @@ func (b *resumingBody) Read(p []byte) (int, error) {
 	}
 }
 
-// resume reopens the download from b.off. It gives up after maxResumes
-// attempts, when the transfer's deadline passed, or when the server
-// refuses (a one-time file, a link gone in the meantime).
+// resume reopens the download from b.off. A busy or failing server (408,
+// 429, 5xx) is asked again after a pause, like a lost connection. It gives
+// up after maxResumes attempts in a row without a byte, when the transfer's
+// deadline passed, or when the server refuses (a link gone meanwhile, a
+// one-time file whose resume window closed).
 func (b *resumingBody) resume(cause error) error {
 	_ = b.body.Close()
+	if b.off > b.resumedAt {
+		b.tries = 0 // bytes came since the last resume: a new break, a new budget
+	}
+	b.resumedAt = b.off
 	fail := func(err error) error {
+		// Before its first byte, the server may have rolled the download
+		// back: the file is called lost only once bytes came.
+		if b.oneTime && b.off > 0 {
+			err = fmt.Errorf("%w\nThis one-time file was used up when the download started, and its transfer could not be resumed: it cannot be downloaded again", err)
+		}
 		b.failure = err
 		return err
 	}
@@ -299,13 +336,33 @@ func (b *resumingBody) resume(cause error) error {
 		if sleepCtx(b.ctx, wait) != nil {
 			return fail(ctxError(b.ctx, "Download"))
 		}
-		resp, err := b.open(b.ctx, b.off)
+		resp, err := b.open(b.ctx, b.off, b.ticket)
 		if err != nil {
 			cause = err
 			continue
 		}
-		switch resp.StatusCode {
-		case http.StatusPartialContent:
+		switch {
+		case resp.StatusCode == http.StatusNotFound && b.off == 0 && b.ticket != "":
+			// Broken before its first byte: the server may have rolled the
+			// download back (the file is not used up, the ticket is gone).
+			// Ask once more without the ticket, as a fresh download; the
+			// file is not lost unless a new answer says it is used up.
+			_ = resp.Body.Close()
+			b.ticket = ""
+			b.oneTime = false
+			b.tries--
+			continue
+		case resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
+			cause = statusCause(resp.StatusCode, readDetail(resp))
+			if ra := retryAfterSeconds(resp.Header.Get("Retry-After")); ra > 0 {
+				if sleepCtx(b.ctx, retryAfterPause(resp.Header.Get("Retry-After"))) != nil {
+					_ = resp.Body.Close()
+					return fail(ctxError(b.ctx, "Download"))
+				}
+			}
+			_ = resp.Body.Close()
+			continue
+		case resp.StatusCode == http.StatusPartialContent:
 			start, ok := contentRangeStart(resp.Header.Get("Content-Range"))
 			if !ok || start != b.off {
 				_ = resp.Body.Close()
@@ -313,7 +370,11 @@ func (b *resumingBody) resume(cause error) error {
 			}
 			b.body = resp.Body
 			return nil
-		case http.StatusOK:
+		case resp.StatusCode == http.StatusOK:
+			// A fresh download (after a roll-back) brings a ticket of its own.
+			if t := resp.Header.Get("X-Resume-Ticket"); t != "" {
+				b.ticket, b.oneTime = t, true
+			}
 			// Range not honoured: skip what is already on disk.
 			if _, err := io.CopyN(io.Discard, resp.Body, b.off); err != nil {
 				_ = resp.Body.Close()
@@ -328,6 +389,23 @@ func (b *resumingBody) resume(cause error) error {
 			return fail(err)
 		}
 	}
+}
+
+// readIdle is one read of the current body, which is closed if the read
+// waits longer than downloadIdle.
+func (b *resumingBody) readIdle(p []byte) (int, error) {
+	body := b.body
+	var stalled atomic.Bool
+	t := time.AfterFunc(downloadIdle, func() {
+		stalled.Store(true)
+		_ = body.Close()
+	})
+	n, err := body.Read(p)
+	t.Stop()
+	if err != nil && stalled.Load() && !errors.Is(err, io.EOF) {
+		err = fmt.Errorf("no data for %s", downloadIdle)
+	}
+	return n, err
 }
 
 func (b *resumingBody) Close() error {

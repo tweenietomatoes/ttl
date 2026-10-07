@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -46,7 +47,14 @@ func newH3Client() *http.Client {
 // newTCPClient returns the HTTP/1.1+2 client. Every request carries its own
 // context deadline; a non-zero transferTimeout additionally caps the whole
 // exchange (TLS + body + response).
+// testTransport, set by a test, replaces the TCP transport (a slow link,
+// which the loopback's buffers cannot play for test-sized parts).
+var testTransport http.RoundTripper
+
 func newTCPClient(transferTimeout time.Duration) *http.Client {
+	if testTransport != nil {
+		return &http.Client{Timeout: transferTimeout, Transport: testTransport, CheckRedirect: noRedirect}
+	}
 	base := http.DefaultTransport.(*http.Transport).Clone()
 	base.ForceAttemptHTTP2 = true
 	base.IdleConnTimeout = 120 * time.Second
@@ -54,6 +62,16 @@ func newTCPClient(transferTimeout time.Duration) *http.Client {
 		base.TLSClientConfig = &tls.Config{}
 	}
 	base.TLSClientConfig.MinVersion = tls.VersionTLS13
+	// A connection that died without a word (Wi-Fi roaming, a VPN or NAT
+	// that forgot it, a laptop waking up) is noticed in about 30 s instead
+	// of the system's TCP timeouts: a ping after 15 s without a frame, and
+	// no answer within 15 s, closes it; so does a minute without a byte
+	// written. The transfer then resumes on a new connection.
+	base.HTTP2 = &http.HTTP2Config{
+		SendPingTimeout:  15 * time.Second,
+		PingTimeout:      15 * time.Second,
+		WriteByteTimeout: time.Minute,
+	}
 	return &http.Client{
 		Timeout:       transferTimeout,
 		Transport:     base,
@@ -65,10 +83,17 @@ func newTCPClient(transferTimeout time.Duration) *http.Client {
 // given, TCP otherwise. The first transport-level failure over HTTP/3 (a
 // network that drops UDP, a QUIC handshake that times out) moves the run
 // to TCP for good, so it costs one failed request rather than one per
-// request.
+// request. Upload parts go concurrently, so the switch is locked.
 type httpConn struct {
+	mu     sync.Mutex
 	client *http.Client
 	h3     bool
+}
+
+func (h *httpConn) current() (*http.Client, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.client, h.h3
 }
 
 func newConn() *httpConn {
@@ -99,11 +124,12 @@ func newRequest(ctx context.Context, method, rawURL string, body io.Reader) (*ht
 // line, checked by validateServerURL / parseURL (https, or http to
 // loopback only); the CLI has no other destination.
 func (h *httpConn) do(req *http.Request) (*http.Response, error) {
-	resp, err := h.client.Do(req) //nolint:gosec // G704: user-chosen, validated destination (see above)
-	if err == nil || !h.h3 || req.Context().Err() != nil {
+	client, h3 := h.current()
+	resp, err := client.Do(req) //nolint:gosec // G704: user-chosen, validated destination (see above)
+	if err == nil || !h3 || req.Context().Err() != nil {
 		return resp, err
 	}
-	h.fallbackToTCP()
+	h.fallbackToTCP(client)
 	if req.Body != nil && req.GetBody == nil {
 		return nil, err
 	}
@@ -115,19 +141,25 @@ func (h *httpConn) do(req *http.Request) (*http.Response, error) {
 		}
 		retry.Body = body
 	}
-	return h.client.Do(retry) //nolint:gosec // G704: same validated destination
+	client, _ = h.current()
+	return client.Do(retry) //nolint:gosec // G704: same validated destination
 }
 
-// fallbackToTCP replaces the HTTP/3 client with a TCP one.
-func (h *httpConn) fallbackToTCP() {
-	if !h.h3 {
+// fallbackToTCP replaces the HTTP/3 client that failed with a TCP one. A
+// request that failed on it while another had already switched does
+// nothing.
+func (h *httpConn) fallbackToTCP(failed *http.Client) {
+	h.mu.Lock()
+	if !h.h3 || h.client != failed {
+		h.mu.Unlock()
 		return
 	}
 	h.h3 = false
-	if closer, ok := h.client.Transport.(io.Closer); ok {
+	h.client = newTCPClient(0)
+	h.mu.Unlock()
+	if closer, ok := failed.Transport.(io.Closer); ok {
 		_ = closer.Close()
 	}
-	h.client = newTCPClient(0)
 	if !jsonMode {
 		fmt.Fprintf(os.Stderr, "\n%sH3: Falling back to TCP%s\n", c(cGray), c(cReset))
 	}

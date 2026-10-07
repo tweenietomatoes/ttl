@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -370,10 +371,16 @@ func TestAttack_HandleHTTPError_LargeBody(t *testing.T) {
 
 // TestAttack_RunSend_MaliciousServerResponses sends files to servers that return bad responses.
 func TestAttack_RunSend_MaliciousServerResponses(t *testing.T) {
+	// A server that keeps failing is given up on after resumeGiveUp; a
+	// short one keeps these cases quick.
+	old := resumeGiveUp
+	resumeGiveUp = 500 * time.Millisecond
+	t.Cleanup(func() { resumeGiveUp = old })
 	cases := []struct {
 		name    string
 		handler http.HandlerFunc
 		wantErr bool
+		puts    int32 // PUT /v1/files requests expected (0: not checked)
 	}{
 		{
 			"server returns 201 with XSS in link",
@@ -385,6 +392,7 @@ func TestAttack_RunSend_MaliciousServerResponses(t *testing.T) {
 				})
 			},
 			false, // link goes to stdout, not rendered as HTML
+			1,
 		},
 		{
 			"server returns 201 with control chars in link",
@@ -396,6 +404,7 @@ func TestAttack_RunSend_MaliciousServerResponses(t *testing.T) {
 				})
 			},
 			false, // control chars are stripped before printing
+			1,
 		},
 		{
 			"server returns 201 with extremely long link",
@@ -407,6 +416,7 @@ func TestAttack_RunSend_MaliciousServerResponses(t *testing.T) {
 				})
 			},
 			true, // exceeds the 4 KB LimitReader on response parsing
+			1,
 		},
 		{
 			"server returns 413",
@@ -418,6 +428,7 @@ func TestAttack_RunSend_MaliciousServerResponses(t *testing.T) {
 				})
 			},
 			true,
+			1,
 		},
 		{
 			"server returns 429 rate limit",
@@ -429,6 +440,7 @@ func TestAttack_RunSend_MaliciousServerResponses(t *testing.T) {
 				})
 			},
 			true,
+			0,
 		},
 		{
 			"server hangs then closes",
@@ -442,6 +454,7 @@ func TestAttack_RunSend_MaliciousServerResponses(t *testing.T) {
 				}
 			},
 			true,
+			0,
 		},
 		{
 			"server returns empty 201",
@@ -450,6 +463,7 @@ func TestAttack_RunSend_MaliciousServerResponses(t *testing.T) {
 				w.WriteHeader(201)
 			},
 			true,
+			1,
 		},
 		{
 			"server returns 201 with null link",
@@ -459,6 +473,7 @@ func TestAttack_RunSend_MaliciousServerResponses(t *testing.T) {
 				w.Write([]byte(`{"link":null}`))
 			},
 			true,
+			1,
 		},
 		{
 			"server returns 201 with integer link",
@@ -468,17 +483,20 @@ func TestAttack_RunSend_MaliciousServerResponses(t *testing.T) {
 				w.Write([]byte(`{"link":12345}`))
 			},
 			true, // integer can't decode into a string field
+			1,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			h := tc.handler
+			var puts atomic.Int32
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/v1/limits" {
 					writeMockLimits(w)
 					return
 				}
+				puts.Add(1)
 				h(w, r)
 			}))
 			defer srv.Close()
@@ -492,6 +510,10 @@ func TestAttack_RunSend_MaliciousServerResponses(t *testing.T) {
 			}
 			if !tc.wantErr && err != nil {
 				t.Fatalf("unexpected error: %v", err)
+			}
+			// A whole answer, good or bad, is not asked for again.
+			if tc.puts != 0 && puts.Load() != tc.puts {
+				t.Fatalf("PUT requests = %d, want %d", puts.Load(), tc.puts)
 			}
 		})
 	}

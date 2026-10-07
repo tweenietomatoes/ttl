@@ -14,6 +14,9 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tweenietomatoes/ttl/internal/crypto"
@@ -21,39 +24,59 @@ import (
 
 // Uploads.
 //
-// A file whose encrypted size exceeds multipartMinBytes goes through the
-// server's resumable upload API: POST /v1/uploads opens a session, each
-// part of the server's part_size is one PUT with its SHA-256 in
-// Content-Digest, and POST …/complete assembles the object and answers
-// like PUT /v1/files. A part that fails (a dropped connection, a 5xx, a
-// digest mismatch on the way) is sent again from memory, so a broken
-// transfer continues where it stopped instead of starting over. Smaller
-// files go in one PUT /v1/files, sent again in full when the connection
-// breaks. A server without sessions (501) gets the single PUT for every
-// size.
+// A file whose encrypted size fits in one part (singleMaxBytes) goes in one
+// request: PUT /v1/files with its SHA-256 in Content-Digest, stored only if
+// what arrived matches. A larger file goes through the server's resumable
+// upload API, as the web page's do: POST /v1/uploads opens a session, each
+// part of the server's part_size is one PUT with its SHA-256, and
+// POST …/complete assembles the object and answers as PUT /v1/files does.
+// Either way the bytes go from memory: a request that fails (a dropped
+// connection, a 5xx, a digest mismatch on the way) is sent again, so a
+// broken transfer continues where it stopped instead of starting over.
 
 const (
 	minPartSize    = 64 << 10  // sanity bounds on the server's part_size;
 	maxPartSize    = 128 << 20 // one part is held in memory
-	resumeGiveUp   = 15 * time.Minute
 	maxRetryPause  = 30 * time.Second
 	rateLimitPause = 2 * time.Second
 	digestRetries  = 3
-	wholeAttempts  = 3
+	cutRetries     = 3    // a 201 whose body broke off is asked for again this often
+	maxAnswer      = 4096 // the largest 201 body taken as an answer
 	createAttempts = 3
+	// Parts on the way at once: the next part goes up while the server
+	// writes the last one to storage, which would otherwise leave the
+	// connection idle for that long after every part. After a failed or
+	// slow part the rest go one at a time (oneAtATime): on a weak link two
+	// parts only share it, and a break loses both.
+	partsInFlight = 2
+	slowPart      = time.Minute
 )
 
 // Tunable in tests.
 var (
-	multipartMinBytes int64 = 16 << 20 // above one server part (uploadPartSize on the server)
-	retryBase               = time.Second
-	partMinGap              = 400 * time.Millisecond // between requests: the edge allows 30 per 10 s
+	// Files up to this size (encrypted) go in one request: the server's
+	// part size, the most it takes at once. A test lowers it to send small
+	// files in parts.
+	singleMaxBytes int64 = 16 << 20
+	retryBase            = time.Second
+	partMinGap           = 400 * time.Millisecond // between requests: the edge allows 30 per 10 s
+	resumeGiveUp         = 15 * time.Minute       // an upload with no progress this long gives up
+	// An attempt whose bytes stopped moving for partIdle is given up (the
+	// connection died without saying so; the server drops a silent request
+	// at 90 s with 408, which usually comes first), and so is one whose
+	// answer has not come partReply after all of it went out. A slow but
+	// moving attempt is never cut, however long it takes.
+	partIdle  = 2 * time.Minute
+	partReply = 5 * time.Minute
 )
 
 var (
-	errNoSessions  = errors.New("resumable uploads unavailable")
 	errAborted     = errors.New("transfer aborted")
 	errSessionLost = errors.New("Upload session expired on the server (idle too long, or the server restarted); run the command again")
+	// errAnswerCut: the 201 body broke off on the way. The server gives the
+	// request sent again the same answer, so it is worth asking again; a
+	// body that arrived whole but is not a valid answer is final.
+	errAnswerCut = errors.New("answer cut off")
 )
 
 // uploadResult is the 201 body of PUT /v1/files and of
@@ -90,18 +113,31 @@ type uploader struct {
 	burn         bool
 	uploaderOnly bool
 	prog         *progress
-	lastLanded   time.Time // when the server last accepted something
-	nextStart    time.Time // earliest start of the next request (partMinGap)
+	mu           sync.Mutex // guards nextStart: parts go up concurrently
+	nextStart    time.Time  // earliest start of the next request (partMinGap)
+	oneAtATime   atomic.Bool
+	// The last progress, as time since progressClock: something landed, or
+	// an attempt got further into its bytes than any before it (a slow link
+	// moving a part for minutes is progress; sending the same bytes again
+	// is not).
+	lastProgress atomic.Int64
+}
+
+// progressClock is read on the monotonic clock: a laptop's sleep or a clock
+// change is not taken for time without progress.
+var progressClock = time.Now()
+
+func (u *uploader) markProgress() { u.lastProgress.Store(int64(time.Since(progressClock))) }
+
+func (u *uploader) sinceProgress() time.Duration {
+	return time.Since(progressClock) - time.Duration(u.lastProgress.Load())
 }
 
 func (u *uploader) run() (*uploadResult, error) {
-	if u.encSize > multipartMinBytes {
-		res, err := u.putParts()
-		if !errors.Is(err, errNoSessions) {
-			return res, err
-		}
+	if u.encSize <= singleMaxBytes {
+		return u.putSingle()
 	}
-	return u.putWhole()
+	return u.putParts()
 }
 
 // setHeaders sets the upload headers shared by PUT /v1/files and
@@ -156,78 +192,55 @@ func stopEncrypt(pr *io.PipeReader, errCh <-chan error) error {
 
 // ── One request ──
 
-// putWhole sends the file in one PUT /v1/files. A transport failure
-// (including the HTTP/3 fallback) re-encrypts and sends again, up to
-// wholeAttempts times.
-func (u *uploader) putWhole() (*uploadResult, error) {
-	var lastErr error
-	for attempt := 1; attempt <= wholeAttempts; attempt++ {
-		res, retry, err := u.putWholeOnce()
-		if err == nil {
-			return res, nil
-		}
-		if !retry {
-			return nil, err
-		}
-		if u.ctx.Err() != nil {
-			return nil, ctxError(u.ctx, "Upload")
-		}
-		lastErr = err
-		if attempt < wholeAttempts {
-			pause := jittered(retryBase << (attempt - 1))
-			u.prog.note(fmt.Sprintf("Upload interrupted (%v), retrying in %s", err, pause.Round(time.Millisecond)))
-			if sleepCtx(u.ctx, pause) != nil {
-				return nil, ctxError(u.ctx, "Upload")
-			}
-		}
-	}
-	return nil, lastErr
-}
-
-// putWholeOnce reports retry=true for a transport-level failure.
-func (u *uploader) putWholeOnce() (*uploadResult, bool, error) {
-	pr, errCh, err := u.startEncrypt()
+// putSingle sends a file of one part in one PUT /v1/files.
+func (u *uploader) putSingle() (*uploadResult, error) {
+	data, err := u.encryptAll()
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	u.prog.set(0)
-	req, err := newRequest(u.ctx, http.MethodPut, u.server+"/v1/files", u.prog.reader(pr))
+	u.markProgress()
+	var res *uploadResult
+	err = u.send(u.ctx, sendTarget{
+		url:    u.server + "/v1/files",
+		what:   "the file",
+		header: u.setHeaders,
+		ok:     http.StatusCreated,
+		result: func(r io.Reader) (err error) {
+			res, err = parseUploadResult(r)
+			return err
+		},
+	}, data)
 	if err != nil {
-		_ = stopEncrypt(pr, errCh)
-		return nil, false, err
-	}
-	req.ContentLength = u.encSize
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("X-Upload-Path", "stream")
-	u.setHeaders(req.Header)
-	resp, err := u.hc.do(req)
-	if err != nil {
-		if encErr := stopEncrypt(pr, errCh); encErr != nil {
-			return nil, false, fmt.Errorf("Encryption failed: %w", encErr)
-		}
-		return nil, true, fmt.Errorf("Upload failed: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated {
-		// The server answered before reading everything; free the encryptor.
-		_ = stopEncrypt(pr, errCh)
-		return nil, false, handleUploadError(resp)
-	}
-	// A 201 means the server took the whole stream, so the encryptor is
-	// done or about to close the pipe; closing the read side too cannot
-	// hurt it then. It does catch a server that answered early: the writer
-	// would still be blocked, and what was stored is not the file.
-	_ = pr.CloseWithError(errAborted)
-	encErr := <-errCh
-	if errors.Is(encErr, errAborted) || errors.Is(encErr, io.ErrClosedPipe) {
-		return nil, false, fmt.Errorf("Upload failed: the server answered before the whole file was sent")
-	}
-	if encErr != nil {
-		return nil, false, fmt.Errorf("Encryption failed: %w", encErr)
+		return nil, err
 	}
 	u.prog.finish()
-	res, err := parseUploadResult(resp.Body)
-	return res, false, err
+	return res, nil
+}
+
+// encryptAll encrypts the whole file into memory, for the single request.
+func (u *uploader) encryptAll() ([]byte, error) {
+	pr, errCh, err := u.startEncrypt()
+	if err != nil {
+		return nil, err
+	}
+	data := make([]byte, u.encSize)
+	if _, err := io.ReadFull(pr, data); err != nil {
+		if encErr := stopEncrypt(pr, errCh); encErr != nil {
+			return nil, fmt.Errorf("Encryption failed: %w", encErr)
+		}
+		return nil, fmt.Errorf("Encryption failed: %w", err)
+	}
+	// The stream must end exactly here.
+	var extra [1]byte
+	if k, _ := pr.Read(extra[:]); k > 0 {
+		_ = stopEncrypt(pr, errCh)
+		return nil, fmt.Errorf("Encryption failed: stream longer than expected")
+	}
+	if encErr := <-errCh; encErr != nil {
+		return nil, fmt.Errorf("Encryption failed: %w", encErr)
+	}
+	return data, nil
 }
 
 // ── Resumable session ──
@@ -245,28 +258,99 @@ func (u *uploader) putParts() (*uploadResult, error) {
 		return nil, err
 	}
 	u.prog.set(0)
-	u.lastLanded = time.Now()
-	buf := make([]byte, sess.PartSize)
-	var offset int64
+	u.markProgress()
+
+	// The encrypted stream is cut into parts here, and partsInFlight
+	// senders put them up; each part keeps its buffer until the server has
+	// it. The first part that fails for good stops the others.
+	ctx, cancel := context.WithCancel(u.ctx)
+	defer cancel()
+	var (
+		wg       sync.WaitGroup
+		failOnce sync.Once
+		partErr  error
+	)
+	fail := func(err error) {
+		failOnce.Do(func() {
+			partErr = err
+			cancel()
+		})
+	}
+	type job struct {
+		n    int
+		data []byte
+	}
+	jobs := make(chan job)
+	free := make(chan []byte, partsInFlight)
+	for range partsInFlight {
+		free <- make([]byte, sess.PartSize)
+	}
+	for i := range partsInFlight {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				if i > 0 && u.oneAtATime.Load() {
+					return
+				}
+				j, ok := <-jobs
+				if !ok {
+					return
+				}
+				if ctx.Err() != nil { // another part has failed
+					continue
+				}
+				if err := u.sendPart(ctx, base, j.n, j.data); err != nil {
+					// Not reused: the transport may still be reading a
+					// request it gave up on (http.RoundTripper closes the
+					// body in its own time), and the upload ends anyway.
+					fail(err)
+					continue
+				}
+				free <- j.data[:cap(j.data)]
+			}
+		}()
+	}
+	var readErr error
+produce:
 	for n := 1; n <= sess.Parts; n++ {
+		var buf []byte
+		select {
+		case buf = <-free:
+		case <-ctx.Done():
+			break produce
+		}
 		want := sess.PartSize
 		if n == sess.Parts {
 			want = u.encSize - int64(sess.Parts-1)*sess.PartSize
 		}
-		if _, readErr := io.ReadFull(pr, buf[:want]); readErr != nil {
-			encErr := stopEncrypt(pr, errCh)
-			u.abortSession(base)
-			if encErr != nil {
-				return nil, fmt.Errorf("Encryption failed: %w", encErr)
-			}
+		if _, err := io.ReadFull(pr, buf[:want]); err != nil {
+			// Stops the part on the way too: the upload is lost anyway.
+			readErr = err
+			fail(fmt.Errorf("Encryption failed: %w", err))
+			break
+		}
+		select {
+		case jobs <- job{n, buf[:want]}:
+		case <-ctx.Done():
+			break produce
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	if readErr != nil || partErr != nil || ctx.Err() != nil {
+		encErr := stopEncrypt(pr, errCh)
+		u.abortSession(base)
+		switch {
+		case encErr != nil:
+			return nil, fmt.Errorf("Encryption failed: %w", encErr)
+		case partErr != nil:
+			return nil, partErr
+		case readErr != nil:
 			return nil, fmt.Errorf("Encryption failed: %w", readErr)
+		default:
+			return nil, ctxError(u.ctx, "Upload")
 		}
-		if err := u.sendPart(base, n, buf[:want], offset); err != nil {
-			_ = stopEncrypt(pr, errCh)
-			u.abortSession(base)
-			return nil, err
-		}
-		offset += want
 	}
 	// The stream must end exactly here.
 	var extra [1]byte
@@ -289,7 +373,7 @@ func (u *uploader) putParts() (*uploadResult, error) {
 }
 
 // createSession opens a session; 5xx and network errors are tried again
-// a few times, a server without sessions answers errNoSessions.
+// a few times.
 func (u *uploader) createSession() (*uploadSession, error) {
 	pause := retryBase
 	for attempt := 1; ; attempt++ {
@@ -332,8 +416,8 @@ func (u *uploader) createSession() (*uploadSession, error) {
 func (u *uploader) parseSession(resp *http.Response) (*uploadSession, bool, error) {
 	switch resp.StatusCode {
 	case http.StatusCreated:
-	case http.StatusNotImplemented, http.StatusNotFound, http.StatusMethodNotAllowed:
-		return nil, true, errNoSessions
+	case http.StatusNotImplemented:
+		return nil, true, handleUploadError(resp)
 	default:
 		if resp.StatusCode >= 500 {
 			return nil, false, statusCause(resp.StatusCode, readDetail(resp))
@@ -354,76 +438,140 @@ func (u *uploader) parseSession(resp *http.Response) (*uploadSession, bool, erro
 	return &sess, true, nil
 }
 
-// sendPart sends part n until the server has it. A network error, a stall
-// (408) or a 5xx is tried again with a growing pause; a 429 is waited out;
-// a 422 (the bytes arrived altered) is resent at once; a 404 means the
-// session is gone; any other refusal is final.
-func (u *uploader) sendPart(base string, n int, data []byte, offset int64) error {
+// sendPart sends part n of the session at base until the server has it.
+func (u *uploader) sendPart(pctx context.Context, base string, n int, data []byte) error {
+	return u.send(pctx, sendTarget{
+		url:  base + "/parts/" + strconv.Itoa(n),
+		what: "part " + strconv.Itoa(n),
+		ok:   http.StatusNoContent,
+		gone: errSessionLost,
+	}, data)
+}
+
+// sendTarget is where send puts its bytes: a part of a session, or a whole
+// file of one part.
+type sendTarget struct {
+	url    string
+	what   string                // "part 3", "the file": for notes and errors
+	header func(http.Header)     // headers besides the digest and the API key
+	ok     int                   // the answer that means stored
+	result func(io.Reader) error // reads that answer's body
+	gone   error                 // what a 404 means; nil: a refusal like any other
+}
+
+// send puts data at t until the server has it. A network error, a stall
+// (408), a takeover by a newer request (409) or a 5xx is tried again with
+// a growing pause, and so is an answer whose body was cut off, up to
+// cutRetries times (the server keeps it for a request sent again); a 429
+// is waited out; a 422 (the bytes arrived altered) is resent at once; an
+// answer that arrived whole but cannot be read, and any other refusal,
+// is final.
+func (u *uploader) send(pctx context.Context, t sendTarget, data []byte) error {
 	sum := sha256.Sum256(data)
 	digest := "sha-256=:" + base64.StdEncoding.EncodeToString(sum[:]) + ":"
-	partURL := base + "/parts/" + strconv.Itoa(n)
+	// The bar counts the bytes as they go; an attempt sent again first
+	// gives back what the one before counted. reached is the furthest any
+	// attempt got: going beyond it is progress.
+	var counted, reached atomic.Int64
 	body := func() io.ReadCloser {
-		u.prog.set(offset)
-		return io.NopCloser(u.prog.reader(bytes.NewReader(data)))
+		u.prog.back(counted.Swap(0))
+		return io.NopCloser(&partReader{r: bytes.NewReader(data), p: u.prog, n: &counted, reached: &reached, moved: u.markProgress})
 	}
 	pause := retryBase
-	mismatches := 0
+	mismatches, cuts := 0, 0
 	for {
-		if err := u.pace(); err != nil {
+		if err := u.pace(pctx); err != nil {
 			return err
 		}
-		ctx, cancel := context.WithTimeout(u.ctx, partTimeout(int64(len(data))))
-		req, err := newRequest(ctx, http.MethodPut, partURL, body())
+		ctx, cancel := context.WithCancel(pctx)
+		started := time.Now()
+		req, err := newRequest(ctx, http.MethodPut, t.url, body())
 		if err != nil {
 			cancel()
 			return err
 		}
+		why, stopWatch := watchAttempt(&counted, int64(len(data)), cancel)
 		req.ContentLength = int64(len(data))
 		req.GetBody = func() (io.ReadCloser, error) { return body(), nil }
 		req.Header.Set("Content-Type", "application/octet-stream")
 		req.Header.Set("Content-Digest", digest)
+		if t.header != nil {
+			t.header(req.Header)
+		}
 		setAPIKeyHeader(req.Header, u.apiKey)
 		resp, err := u.hc.do(req)
 		status := 0
+		cut := false
 		var detail, retryAfter string
 		if err == nil {
 			status = resp.StatusCode
-			detail = readDetail(resp)
 			retryAfter = resp.Header.Get("Retry-After")
+			if status == t.ok && t.result != nil {
+				err = t.result(resp.Body)
+				cut = errors.Is(err, errAnswerCut)
+			} else if status != t.ok {
+				detail = readDetail(resp)
+			}
 			_ = resp.Body.Close()
 		}
+		stopWatch()
 		cancel()
+		if err != nil && status == t.ok && !cut {
+			return err // a whole answer that cannot be read: asking again gets the same
+		}
+		if cut {
+			if cuts++; cuts > cutRetries {
+				return answerLost(err)
+			}
+		}
+		if err != nil {
+			if w := why(); w != "" {
+				err = errors.New(w)
+			}
+			status = 0
+		}
 
 		wait := jittered(pause)
 		backoff := true
 		switch {
-		case err == nil && status == http.StatusNoContent:
-			u.lastLanded = time.Now()
-			u.prog.set(offset + int64(len(data)))
+		case err == nil && status == t.ok:
+			if time.Since(started) > slowPart {
+				u.oneAtATime.Store(true)
+			}
+			u.markProgress()
+			u.prog.back(counted.Load() - int64(len(data))) // exactly the bytes, whatever was read
 			return nil
-		case err == nil && status == http.StatusNotFound:
-			return errSessionLost
+		case err == nil && status == http.StatusNotFound && t.gone != nil:
+			return t.gone
 		case err == nil && status == http.StatusUnprocessableEntity:
 			mismatches++
 			if mismatches >= digestRetries {
-				return fmt.Errorf("Upload failed: part %d keeps arriving altered (digest mismatch)", n)
+				return fmt.Errorf("Upload failed: %s keeps arriving altered (digest mismatch)", t.what)
 			}
 			continue
 		case err == nil && status == http.StatusTooManyRequests:
+			if quotaRefusal(detail) {
+				return uploadStatusError(status, detail, retryAfter) // waiting minutes does not lift a daily limit
+			}
 			wait = retryAfterPause(retryAfter)
 			backoff = false
-		case err == nil && status < 500 && status != http.StatusRequestTimeout:
+		case err == nil && status < 500 && status != http.StatusRequestTimeout && status != http.StatusConflict:
+			// 408: the server dropped a silent request; 409: a newer request
+			// for the same bytes took over. Both mean "send it again".
 			return uploadStatusError(status, detail, retryAfter)
 		}
 		cause := errorCause(err, status, detail)
-		if u.ctx.Err() != nil {
+		if pctx.Err() != nil {
 			return ctxError(u.ctx, "Upload")
 		}
-		if time.Since(u.lastLanded) > resumeGiveUp {
-			return fmt.Errorf("Upload failed: no progress for %s (part %d: %s)", resumeGiveUp, n, cause)
+		if status != http.StatusTooManyRequests {
+			u.oneAtATime.Store(true) // a link that fails: one part at a time from now on
 		}
-		u.prog.note(fmt.Sprintf("Upload interrupted at part %d (%s), retrying in %s", n, cause, wait.Round(time.Millisecond)))
-		if sleepCtx(u.ctx, wait) != nil {
+		if u.sinceProgress() > resumeGiveUp {
+			return fmt.Errorf("Upload failed: no progress for %s (%s: %s)", resumeGiveUp, t.what, cause)
+		}
+		u.prog.note(fmt.Sprintf("Upload interrupted at %s (%s), retrying in %s", t.what, cause, wait.Round(time.Millisecond)))
+		if sleepCtx(pctx, wait) != nil {
 			return ctxError(u.ctx, "Upload")
 		}
 		if backoff {
@@ -433,12 +581,15 @@ func (u *uploader) sendPart(base string, n int, data []byte, offset int64) error
 }
 
 // complete asks the server to assemble the parts. A 429, a 503 and a 409
-// that names no missing part ("not yet") are waited out; a 5xx and a
-// network error are tried again; a 409 naming parts is final.
+// that names no missing part ("not yet") are waited out; a 5xx, a network
+// error and an answer cut off on the way (up to cutRetries times) are
+// tried again; a 409 naming parts and an answer that arrived whole but
+// cannot be read are final.
 func (u *uploader) complete(base string) (*uploadResult, error) {
 	pause := retryBase
+	cuts := 0
 	for {
-		if err := u.pace(); err != nil {
+		if err := u.pace(u.ctx); err != nil {
 			return nil, err
 		}
 		ctx, cancel := context.WithTimeout(u.ctx, 2*time.Minute)
@@ -457,8 +608,21 @@ func (u *uploader) complete(base string) (*uploadResult, error) {
 			case http.StatusCreated:
 				res, perr := parseUploadResult(resp.Body)
 				_ = resp.Body.Close()
-				cancel()
-				return res, perr
+				if perr == nil {
+					cancel()
+					return res, nil
+				}
+				if !errors.Is(perr, errAnswerCut) {
+					cancel()
+					return nil, perr
+				}
+				if cuts++; cuts > cutRetries {
+					cancel()
+					return nil, answerLost(perr)
+				}
+				// Cut off on the way: the server answers a repeated
+				// complete with the same link.
+				cause = perr.Error()
 			case http.StatusNotFound:
 				_ = resp.Body.Close()
 				cancel()
@@ -497,7 +661,7 @@ func (u *uploader) complete(base string) (*uploadResult, error) {
 		if u.ctx.Err() != nil {
 			return nil, ctxError(u.ctx, "Upload")
 		}
-		if time.Since(u.lastLanded) > resumeGiveUp {
+		if u.sinceProgress() > resumeGiveUp {
 			return nil, fmt.Errorf("Upload failed: could not finish the upload for %s (%s)", resumeGiveUp, cause)
 		}
 		u.prog.note(fmt.Sprintf("Finishing upload (%s), retrying in %s", cause, wait.Round(time.Millisecond)))
@@ -528,28 +692,57 @@ func (u *uploader) abortSession(base string) {
 	_ = resp.Body.Close()
 }
 
-// pace keeps partMinGap between request starts.
-func (u *uploader) pace() error {
-	if wait := time.Until(u.nextStart); wait > 0 {
-		if err := sleepCtx(u.ctx, wait); err != nil {
+// pace keeps partMinGap between request starts, across the parts on the
+// way: each request takes the next free start time.
+func (u *uploader) pace(ctx context.Context) error {
+	u.mu.Lock()
+	now := time.Now()
+	start := now
+	if u.nextStart.After(now) {
+		start = u.nextStart
+	}
+	u.nextStart = start.Add(partMinGap)
+	u.mu.Unlock()
+	if wait := start.Sub(now); wait > 0 {
+		if err := sleepCtx(ctx, wait); err != nil {
 			return ctxError(u.ctx, "Upload")
 		}
 	}
-	u.nextStart = time.Now().Add(partMinGap)
 	return nil
 }
 
 // ── Helpers ──
 
 func parseUploadResult(r io.Reader) (*uploadResult, error) {
+	b, err := io.ReadAll(io.LimitReader(r, maxAnswer+1))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", errAnswerCut, err)
+	}
+	if len(b) > maxAnswer {
+		return nil, fmt.Errorf("Invalid server response: longer than %d bytes", maxAnswer)
+	}
 	var res uploadResult
-	if err := json.NewDecoder(io.LimitReader(r, 4096)).Decode(&res); err != nil {
+	if err := json.Unmarshal(b, &res); err != nil {
 		return nil, fmt.Errorf("Invalid server response: %w", err)
 	}
 	if res.Link == "" {
 		return nil, fmt.Errorf("Server returned empty link")
 	}
 	return &res, nil
+}
+
+// quotaRefusal tells a daily-limit 429 ("Upload limit reached", "Daily
+// upload quota reached"), which holds until the day turns, from a passing
+// one: the same bytes or part still on the way, or the edge's request rate.
+// answerLost: the upload may be stored, but its answer, with the link, kept
+// breaking off on the way back.
+func answerLost(err error) error {
+	return fmt.Errorf("Upload failed: the answer with the link kept breaking off (%v); the file may be stored, but nobody can open it without the link; run the command again", err)
+}
+
+func quotaRefusal(detail string) bool {
+	d := strings.ToLower(detail)
+	return strings.Contains(d, "quota") || strings.Contains(d, "limit reached")
 }
 
 func handleUploadError(resp *http.Response) error {
@@ -643,11 +836,46 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// partTimeout is the time allowed for one request of n bytes (1 Mbps plus
-// a margin, at least 5 minutes).
-func partTimeout(n int64) time.Duration {
-	d, _ := resolveTimeout("", n)
-	return d
+// watchAttempt cancels an attempt whose body has not moved for partIdle,
+// or whose answer has not come partReply after all of it went out. why
+// says which, or "" while neither happened; stop ends the watch.
+func watchAttempt(counted *atomic.Int64, size int64, cancel context.CancelFunc) (why func() string, stop func()) {
+	var reason atomic.Pointer[string]
+	done := make(chan struct{})
+	step := min(max(partIdle/8, 10*time.Millisecond), time.Second)
+	go func() {
+		t := time.NewTicker(step)
+		defer t.Stop()
+		last, since := counted.Load(), time.Now()
+		for {
+			select {
+			case <-done:
+				return
+			case now := <-t.C:
+				n := counted.Load()
+				if n != last {
+					last, since = n, now
+					continue
+				}
+				limit, msg := partIdle, fmt.Sprintf("no data moved for %s", partIdle)
+				if n >= size {
+					limit, msg = partReply, fmt.Sprintf("no answer %s after it was all sent", partReply)
+				}
+				if now.Sub(since) > limit {
+					reason.Store(&msg)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	why = func() string {
+		if p := reason.Load(); p != nil {
+			return *p
+		}
+		return ""
+	}
+	return why, func() { close(done) }
 }
 
 // retryAfterSeconds parses a Retry-After header given in seconds (0 when
@@ -671,6 +899,32 @@ func retryAfterPause(h string) time.Duration {
 		n = 60
 	}
 	return time.Duration(n) * time.Second
+}
+
+// partReader counts what the transport reads of an attempt's bytes into
+// the bar and into the attempt's counter n. Getting further than any
+// attempt before it (reached) calls moved.
+type partReader struct {
+	r       io.Reader
+	p       *progress
+	n       *atomic.Int64
+	reached *atomic.Int64
+	moved   func()
+}
+
+func (pr *partReader) Read(buf []byte) (int, error) {
+	n, err := pr.r.Read(buf)
+	if n > 0 {
+		c := pr.n.Add(int64(n))
+		pr.p.add(n)
+		for r := pr.reached.Load(); c > r; r = pr.reached.Load() {
+			if pr.reached.CompareAndSwap(r, c) {
+				pr.moved()
+				break
+			}
+		}
+	}
+	return n, err
 }
 
 type countingReader struct {

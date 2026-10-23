@@ -459,3 +459,55 @@ func TestHandleHTTPError_Messages(t *testing.T) {
 		}
 	}
 }
+
+// A one-time download whose first answer is lost on the way (twice: Go's
+// HTTP client sends a request again on its own when a reused connection
+// breaks before the answer) carries on with this client's own ticket, from
+// byte 0, instead of starting a new download.
+func TestGet_OneTime_LostFirstAnswerCarriesOn(t *testing.T) {
+	noKeys(t)
+	m := newMockAPI(t)
+	payload := largePayload(t)
+	src := tempFileBytes(t, "big.bin", payload)
+	if err := runSend([]string{"-p", "resume-pass", "-server", m.URL, src}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	m.burn = true
+	m.loseFull = 2
+
+	outDir := t.TempDir()
+	if err := runGet([]string{"-p", "resume-pass", "-o", outDir, m.URL + "/aBcDeFgHiJ"}); err != nil {
+		t.Fatalf("get should carry on with its own ticket: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(outDir, "big.bin"))
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("the file differs: %v", err)
+	}
+	if len(m.ticket) != 43 {
+		t.Fatalf("the first request's own ticket: %q", m.ticket)
+	}
+	for _, nt := range m.newTickets {
+		if nt != m.ticket {
+			t.Fatalf("a full request sent another ticket: %v", m.newTickets)
+		}
+	}
+	if len(m.rangeRequests) != 1 || m.rangeRequests[0] != "bytes=0-" || m.downloadHeaders.Get("X-Resume-Ticket") != m.ticket {
+		t.Fatalf("range requests %v, ticket %q", m.rangeRequests, m.downloadHeaders.Get("X-Resume-Ticket"))
+	}
+}
+
+// A file that is not one-time sends no ticket of its own.
+func TestGet_NoOwnTicketForOrdinaryFiles(t *testing.T) {
+	noKeys(t)
+	m := newMockAPI(t)
+	src := tempFileBytes(t, "small.bin", []byte("plain file"))
+	if err := runSend([]string{"-p", "resume-pass", "-server", m.URL, src}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if err := runGet([]string{"-p", "resume-pass", "-o", t.TempDir(), m.URL + "/aBcDeFgHiJ"}); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if v := m.downloadHeaders.Get("X-New-Ticket"); v != "" {
+		t.Fatalf("an ordinary download sent X-New-Ticket %q", v)
+	}
+}

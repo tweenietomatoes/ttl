@@ -117,7 +117,7 @@ The state is one of `active`, `expired`, `burned` or `deleted`. Files opened in 
 A dropped connection does not restart a transfer:
 
 - **Uploads** go from memory with a SHA-256 `Content-Digest` that the server checks before it stores anything. A file of up to 16 MiB (encrypted) goes in one request; a larger one goes in 16 MiB parts through the server's resumable upload API, two at a time. A request that fails (a lost connection, a 5xx, bytes altered on the way) is sent again, and parts already stored stay stored. The CLI gives up after 15 minutes without progress.
-- **Downloads** resume with a byte-range request from the last byte received; every 64 KiB chunk is authenticated on its own, so a resumed stream decrypts exactly like an unbroken one. A burn-after-reading file is used up when its download starts; the server hands its rest only to that same download, with the resume ticket that came with it, for a few minutes.
+- **Downloads** resume with a byte-range request from the last byte received; every 64 KiB chunk is authenticated on its own, so a resumed stream decrypts exactly like an unbroken one. A burn-after-reading file is used up once a download of it has reached its end. Until then a broken download carries on with its resume ticket, which the CLI draws itself before the first request, so even a first answer lost on the way is picked up again; another `ttl get` starts a new download.
 - **Ctrl-C** cancels cleanly: an open upload session is handed back to the server, and a partial download is removed.
 
 ## 🪐 Orbit plan

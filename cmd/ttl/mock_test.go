@@ -85,6 +85,11 @@ type mockAPI struct {
 	// status instead of serving it (0 serves). attempt starts at 1.
 	fullHook  func(attempt int) int
 	fullCalls int
+	// loseFull: this many full downloads are cut before any answer (the
+	// answer lost on the way); with burn, the first one's X-New-Ticket is
+	// taken as the download's ticket. newTickets: their X-New-Ticket.
+	loseFull   int
+	newTickets []string
 	// cutAfterLast: the first full download sends every byte, chunked, then
 	// hangs up before the end of the stream.
 	cutAfterLast    bool
@@ -394,11 +399,15 @@ func (m *mockAPI) abort(w http.ResponseWriter, r *http.Request) {
 
 func (m *mockAPI) probe(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
-	blob := m.blob
+	blob, burn := m.blob, m.burn
 	m.mu.Unlock()
 	if blob == nil {
 		m.problem(w, 404, "File not found. It may have already been downloaded or expired.")
 		return
+	}
+	if burn {
+		w.Header().Set("X-Burn-Started", "0")
+		w.Header().Set("X-Burn-Starts", "5")
 	}
 	n := min(len(blob), 314)
 	w.Header().Set("Content-Type", "application/octet-stream")
@@ -480,6 +489,24 @@ func (m *mockAPI) download(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	m.mu.Lock()
+	if m.loseFull > 0 {
+		m.loseFull--
+		m.newTickets = append(m.newTickets, r.Header.Get("X-New-Ticket"))
+		if m.burn && m.ticket == "" {
+			m.ticket = r.Header.Get("X-New-Ticket")
+		}
+		m.mu.Unlock()
+		if hj, ok := w.(http.Hijacker); ok {
+			if conn, _, err := hj.Hijack(); err == nil {
+				conn.Close() // before any answer
+				return
+			}
+		}
+		m.t.Error("mock server cannot hijack the connection")
+		return
+	}
+	m.mu.Unlock()
 	w.Header().Set("Content-Type", "application/octet-stream")
 	m.mu.Lock()
 	if m.cutAfterLast && !m.dropped {

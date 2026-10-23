@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -112,6 +113,8 @@ func runGet(args []string) error {
 		defer probeResp.Body.Close()
 		return handleHTTPError(probeResp)
 	}
+	// A one-time file says so in the probe's answer.
+	oneTime := probeResp.Header.Get("X-Burn-Starts") != ""
 
 	// Read probe data into memory (header + metadata, max 314 bytes)
 	probeData, err := io.ReadAll(io.LimitReader(probeResp.Body, int64(crypto.ProbeMaxBytes)+1))
@@ -169,11 +172,22 @@ func runGet(args []string) error {
 	if err != nil {
 		return fmt.Errorf("Invalid URL: %w", err)
 	}
-	// A one-time file is used up the moment its download starts. The answer
-	// then carries a resume ticket: only with it does the server hand out
-	// the rest after a broken connection (for a few minutes). It stays in
-	// memory, never printed or stored. With a ticket every request after the
-	// first is a range, from byte 0 too.
+	// A one-time file's download has a resume ticket: only with it does the
+	// server hand out the rest after a broken connection. The ticket is this
+	// client's own (X-New-Ticket; a server that does not take it draws one
+	// and sends it with its answer), so it is known before the first answer
+	// comes: a first request whose answer is lost on the way is carried on
+	// with it, from byte 0, instead of starting the download anew. It stays
+	// in memory, never printed or stored. With a ticket every request after
+	// the first is a range, from byte 0 too.
+	var mine string
+	if oneTime {
+		raw, err := randomBytes(32)
+		if err != nil {
+			return err
+		}
+		mine = base64.RawURLEncoding.EncodeToString(raw)
+	}
 	open := func(ctx context.Context, from int64, ticket string) (*http.Response, error) {
 		req, reqErr := newRequest(ctx, http.MethodGet, downloadURL, nil)
 		if reqErr != nil {
@@ -187,22 +201,32 @@ func runGet(args []string) error {
 		}
 		if ticket != "" {
 			req.Header.Set("X-Resume-Ticket", ticket)
+		} else if from == 0 && mine != "" {
+			req.Header.Set("X-New-Ticket", mine)
 		}
 		return hc.do(req)
 	}
 
+	var first io.ReadCloser = http.NoBody
+	var ticket string
+	var lost error
 	resp, err := open(dlCtx, 0, "")
-	if err != nil {
+	switch {
+	case err != nil && (mine == "" || dlCtx.Err() != nil):
 		return fmt.Errorf("Download failed: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
+	case err != nil:
+		// No answer: the download may have started all the same. It is
+		// carried on with this client's ticket, from byte 0.
+		ticket, lost = mine, err
+	case resp.StatusCode != http.StatusOK:
 		defer resp.Body.Close()
 		return handleHTTPError(resp)
+	default:
+		first, ticket = resp.Body, resp.Header.Get("X-Resume-Ticket")
 	}
 
 	prog := newProgress(encTotal, int64(probeFileSize), jsonMode) //nolint:gosec // file size is capped at 1 TB by parseMetadata, fits int64
-	ticket := resp.Header.Get("X-Resume-Ticket")
-	body := &resumingBody{ctx: dlCtx, open: open, body: resp.Body, total: encTotal, prog: prog, ticket: ticket, oneTime: ticket != ""}
+	body := &resumingBody{ctx: dlCtx, open: open, body: first, total: encTotal, prog: prog, ticket: ticket, oneTime: ticket != "", broken: lost, mine: mine}
 	defer func() { _ = body.Close() }()
 	origName, filename, written, err := crypto.DecryptStreamWithKey(prog.reader(body), encKey, outputDir)
 	prog.finish()
@@ -254,8 +278,9 @@ var downloadIdle = time.Minute
 // request and carries on where it stopped. Every 64 KiB chunk is its own
 // authenticated block, so the decryptor sees one continuous stream. A
 // server that ignores Range (200) has the bytes already received skipped.
-// A one-time file resumes only with the ticket its first answer carried
-// (see open in runGet); an older server refuses ranges for it.
+// A one-time file resumes only with its download's ticket (see open in
+// runGet): the one its first answer carried, or mine, this client's own,
+// when that answer was lost; an older server refuses ranges for it.
 type resumingBody struct {
 	ctx       context.Context
 	open      func(ctx context.Context, from int64, ticket string) (*http.Response, error)
@@ -265,7 +290,8 @@ type resumingBody struct {
 	tries     int   // attempts since bytes last arrived
 	resumedAt int64 // off at the last resume
 	ticket    string
-	oneTime   bool  // a ticket was seen: a failure loses the file for good
+	mine      string
+	oneTime   bool  // a one-time file's download, with its ticket
 	broken    error // a body error still to be handled on the next Read
 	failure   error // why resuming was given up
 	prog      *progress
@@ -315,10 +341,18 @@ func (b *resumingBody) resume(cause error) error {
 	}
 	b.resumedAt = b.off
 	fail := func(err error) error {
-		// Before its first byte, the server may have rolled the download
-		// back: the file is called lost only once bytes came.
+		// A one-time file is used up once a download of it has reached its
+		// end on the server's side, not before: one given up on the way may
+		// still be there (gone, the server refuses the rest: refusal).
 		if b.oneTime && b.off > 0 {
-			err = fmt.Errorf("%w\nThis one-time file was used up when the download started, and its transfer could not be resumed: it cannot be downloaded again", err)
+			err = fmt.Errorf("%w\nA one-time file is used up only when a download of it reaches its end, so it may still be there: run the same command again", err)
+		}
+		b.failure = err
+		return err
+	}
+	refusal := func(err error) error {
+		if b.oneTime && b.off > 0 {
+			err = fmt.Errorf("%w\nThis one-time file's transfer could not be resumed: it cannot be downloaded again", err)
 		}
 		b.failure = err
 		return err
@@ -339,6 +373,11 @@ func (b *resumingBody) resume(cause error) error {
 		resp, err := b.open(b.ctx, b.off, b.ticket)
 		if err != nil {
 			cause = err
+			// A new download whose answer was lost may have started all the
+			// same: the next try carries on with this client's ticket.
+			if b.ticket == "" && b.off == 0 && b.mine != "" {
+				b.ticket, b.oneTime = b.mine, true
+			}
 			continue
 		}
 		switch {
@@ -386,7 +425,7 @@ func (b *resumingBody) resume(cause error) error {
 		default:
 			err := handleHTTPError(resp)
 			_ = resp.Body.Close()
-			return fail(err)
+			return refusal(err)
 		}
 	}
 }

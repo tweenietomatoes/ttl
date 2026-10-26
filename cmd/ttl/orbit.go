@@ -40,7 +40,7 @@ func runPlan(args []string) error {
 		return err
 	}
 	apiKey := loadAPIKey()
-	limits, err := fetchLimits(newConn(), serverVal, apiKey)
+	limits, err := fetchLimits(newConn(), serverVal, apiKey, 0)
 	if err != nil {
 		return err
 	}
@@ -465,25 +465,19 @@ func apiGetJSON(hc *httpConn, rawURL, apiKey string, out any) error {
 
 // fetchLimits reads GET /v1/limits for the key's plan. A rejected key is
 // a *serverError with status 401; an unreachable server wraps the
-// transport error.
-func fetchLimits(hc *httpConn, serverURL, apiKey string) (map[string]any, error) {
+// transport error. upTo: how long a server that is down is asked again
+// (getWhileDown; 0: once).
+func fetchLimits(hc *httpConn, serverURL, apiKey string, upTo time.Duration) (map[string]any, error) {
 	limitsURL, err := url.JoinPath(serverURL, "/v1/limits")
 	if err != nil {
 		return nil, fmt.Errorf("Invalid server URL: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	req, err := newRequest(ctx, http.MethodGet, limitsURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	setAPIKeyHeader(req.Header, apiKey)
-
-	resp, err := hc.do(req)
+	resp, cancel, err := getWhileDown(hc, limitsURL, apiKey, 15*time.Second, upTo)
 	if err != nil {
 		return nil, fmt.Errorf("Cannot reach server: %w", err)
 	}
+	defer cancel()
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {

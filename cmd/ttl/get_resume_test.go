@@ -160,6 +160,59 @@ func TestGet_Resume_OneTimeRetriesBusyServer(t *testing.T) {
 	}
 }
 
+// A probe that finds the server restarting (503) asks again until it is
+// back; one that keeps failing past downMax is said as such.
+func TestGet_ProbeWaitsForServer(t *testing.T) {
+	m, payload := burnMock(t)
+	m.burn = false
+	m.probeHook = func(attempt int) int {
+		if attempt <= 3 {
+			return 503
+		}
+		return 0
+	}
+	got, err := getInto(t, m)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("get after a restart: err=%v, %d bytes", err, len(got))
+	}
+	if m.probeCalls != 4 {
+		t.Fatalf("probe requests = %d, want 4", m.probeCalls)
+	}
+
+	old := downMax
+	downMax = 50 * time.Millisecond
+	t.Cleanup(func() { downMax = old })
+	m.probeHook = func(int) int { return 503 }
+	if _, err := getInto(t, m); err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("a probe that never got through: %v", err)
+	}
+}
+
+// A download whose first request finds the server restarting (503) starts
+// once it is back; a one-time file's as the same new download.
+func TestGet_FirstRequestWaitsForServer(t *testing.T) {
+	for _, burn := range []bool{false, true} {
+		m, payload := burnMock(t)
+		m.burn = burn
+		m.fullHook = func(attempt int) int {
+			if attempt <= 2 {
+				return 503
+			}
+			return 0
+		}
+		got, err := getInto(t, m)
+		if err != nil || !bytes.Equal(got, payload) {
+			t.Fatalf("burn=%v: get after a restart: err=%v, %d bytes", burn, err, len(got))
+		}
+		if m.fullCalls != 3 || len(m.rangeRequests) != 0 {
+			t.Fatalf("burn=%v: full requests %d, ranges %v", burn, m.fullCalls, m.rangeRequests)
+		}
+		if nt := m.downloadHeaders.Get("X-New-Ticket"); burn != (len(nt) == 43) {
+			t.Fatalf("burn=%v: the last request's own ticket %q", burn, nt)
+		}
+	}
+}
+
 // Every resume that brings bytes starts a new budget: ten breaks in one
 // download, more than maxResumes, still finish.
 func TestGet_Resume_BudgetResetsAfterProgress(t *testing.T) {

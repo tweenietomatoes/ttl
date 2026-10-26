@@ -387,7 +387,7 @@ func TestFetchLimits_KeyRejected(t *testing.T) {
 		json.NewEncoder(w).Encode(map[string]any{"detail": "Invalid or expired API key"})
 	}))
 	defer srv.Close()
-	_, err := fetchLimits(newConn(), srv.URL, keyPrefix+strings.Repeat("x", 48))
+	_, err := fetchLimits(newConn(), srv.URL, keyPrefix+strings.Repeat("x", 48), 0)
 	if !isKeyRejected(err) {
 		t.Fatalf("expected a key rejection, got %v", err)
 	}

@@ -115,6 +115,55 @@ func newRequest(ctx context.Context, method, rawURL string, body io.Reader) (*ht
 	return req, nil
 }
 
+// serverDown reports whether status is the server restarting or its
+// storage failing (502, 503, 504): worth asking again.
+func serverDown(status int) bool {
+	return status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
+}
+
+// downMax: how long a transfer about to start asks again a server that gets
+// no answer, or answers 502, 503 or 504 (restarting: a restart or a reboot
+// of the machine takes a minute or two). A variable for tests.
+var downMax = 2 * time.Minute
+
+// getWhileDown sends GET rawURL (with the API key, if any), each try within
+// timeout, and asks again while it gets no answer or the server is down
+// (serverDown), for up to upTo (0: once). The caller closes the body, then
+// calls cancel.
+func getWhileDown(hc *httpConn, rawURL, apiKey string, timeout, upTo time.Duration) (*http.Response, context.CancelFunc, error) {
+	pause := retryBase
+	start := time.Now()
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		req, err := newRequest(ctx, http.MethodGet, rawURL, nil)
+		if err != nil {
+			cancel()
+			return nil, nil, err
+		}
+		setAPIKeyHeader(req.Header, apiKey)
+		resp, err := hc.do(req)
+		if (err == nil && !serverDown(resp.StatusCode)) || time.Since(start) >= upTo {
+			if err != nil {
+				cancel()
+				return nil, nil, err
+			}
+			return resp, cancel, nil
+		}
+		cause := err
+		if err == nil {
+			cause = statusCause(resp.StatusCode, readDetail(resp))
+			_ = resp.Body.Close()
+		}
+		cancel()
+		wait := jittered(pause)
+		if !jsonMode {
+			fmt.Fprintf(os.Stderr, "Cannot reach the server (%v), retrying in %s\n", cause, wait.Round(time.Millisecond))
+		}
+		time.Sleep(wait)
+		pause = min(pause*2, maxRetryPause)
+	}
+}
+
 // do sends req. When it fails at the transport level over HTTP/3, the run
 // switches to TCP and the same request is sent again there, provided its
 // body can be replayed (none, or one with GetBody). A request whose

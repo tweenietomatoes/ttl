@@ -126,7 +126,7 @@ func runSend(args []string) error {
 
 	// Fetch server-side limits (respects plan tier)
 	hc := newConn()
-	serverLimits, err := fetchLimits(hc, serverVal, apiKey)
+	serverLimits, err := fetchLimits(hc, serverVal, apiKey, downMax)
 	if err != nil {
 		return err
 	}

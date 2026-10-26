@@ -11,13 +11,15 @@ import (
 	"time"
 )
 
-// TestMain shortens the retry pauses, and sends files over 256 KiB in
-// parts where the CLI itself starts at 16 MiB: the parts tests use payloads
-// of about 300 KiB in the mock's 64 KiB parts. Smaller files take the
-// single PUT /v1/files, as they do for real, which is all the small
-// stand-in servers of many tests take.
+// TestMain shortens the retry pauses (and how long a server that is down is
+// asked again before a transfer), and sends files over 256 KiB in parts
+// where the CLI itself starts at 16 MiB: the parts tests use payloads of
+// about 300 KiB in the mock's 64 KiB parts. Smaller files take the single
+// PUT /v1/files, as they do for real, which is all the small stand-in
+// servers of many tests take.
 func TestMain(m *testing.M) {
 	retryBase = 5 * time.Millisecond
+	downMax = 200 * time.Millisecond
 	partMinGap = 0
 	singleMaxBytes = 256 << 10
 	os.Exit(m.Run())

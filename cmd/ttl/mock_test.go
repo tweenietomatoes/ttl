@@ -42,6 +42,16 @@ type mockAPI struct {
 	partAttempts      map[int]int
 	partDigests       map[int]string
 	lastUploadHeaders http.Header // PUT /v1/files or POST /v1/uploads
+	// createHook answers the attempt-th POST /v1/uploads with this status
+	// instead of opening a session (0 opens it). attempt starts at 1.
+	createHook func(attempt int) int
+	// probeHook answers the attempt-th probe with this status instead of
+	// serving it (0 serves); limitsHook the same for GET /v1/limits.
+	// attempt starts at 1.
+	probeHook   func(attempt int) int
+	probeCalls  int
+	limitsHook  func(attempt int) int
+	limitsCalls int
 	// fileHook answers the attempt-th PUT /v1/files with status (and
 	// detail) instead of storing it; 0 stores it. attempt starts at 1.
 	fileHook func(attempt int) (status int, detail string)
@@ -154,7 +164,15 @@ func (m *mockAPI) problem(w http.ResponseWriter, status int, detail string) {
 func (m *mockAPI) limits(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	plan := m.plan
+	m.limitsCalls++
+	hook, attempt := m.limitsHook, m.limitsCalls
 	m.mu.Unlock()
+	if hook != nil {
+		if status := hook(attempt); status != 0 {
+			m.problem(w, status, http.StatusText(status))
+			return
+		}
+	}
 	if plan == "orbit" {
 		if !strings.HasPrefix(r.Header.Get("X-API-Key"), keyPrefix) {
 			m.problem(w, 401, "Invalid API key format")
@@ -241,6 +259,12 @@ func (m *mockAPI) createSession(w http.ResponseWriter, r *http.Request) {
 	if m.noSessions {
 		m.problem(w, 501, "Resumable uploads are not available")
 		return
+	}
+	if m.createHook != nil {
+		if status := m.createHook(m.sessionCalls); status != 0 {
+			m.problem(w, status, http.StatusText(status))
+			return
+		}
 	}
 	size, err := strconv.ParseInt(r.Header.Get("X-File-Size"), 10, 64)
 	if err != nil || size <= 0 {
@@ -400,7 +424,15 @@ func (m *mockAPI) abort(w http.ResponseWriter, r *http.Request) {
 func (m *mockAPI) probe(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	blob, burn := m.blob, m.burn
+	m.probeCalls++
+	hook, attempt := m.probeHook, m.probeCalls
 	m.mu.Unlock()
+	if hook != nil {
+		if status := hook(attempt); status != 0 {
+			m.problem(w, status, http.StatusText(status))
+			return
+		}
+	}
 	if blob == nil {
 		m.problem(w, 404, "File not found. It may have already been downloaded or expired.")
 		return

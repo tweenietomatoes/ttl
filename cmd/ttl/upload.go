@@ -372,10 +372,13 @@ produce:
 	return res, nil
 }
 
-// createSession opens a session; 5xx and network errors are tried again
-// a few times.
+// createSession opens a session. A network error, a 502, 503 or 504 (the
+// server restarting: a restart or a reboot of the machine takes a minute
+// or two, or its storage) is tried again, as a part is, until resumeGiveUp
+// has passed since the first; another 5xx a few times.
 func (u *uploader) createSession() (*uploadSession, error) {
 	pause := retryBase
+	var failing time.Time
 	for attempt := 1; ; attempt++ {
 		ctx, cancel := context.WithTimeout(u.ctx, 30*time.Second)
 		req, err := newRequest(ctx, http.MethodPost, u.server+"/v1/uploads", nil)
@@ -385,6 +388,7 @@ func (u *uploader) createSession() (*uploadSession, error) {
 		}
 		u.setHeaders(req.Header)
 		resp, err := u.hc.do(req)
+		down := err != nil
 		if err == nil {
 			sess, final, perr := u.parseSession(resp)
 			_ = resp.Body.Close()
@@ -393,13 +397,17 @@ func (u *uploader) createSession() (*uploadSession, error) {
 				return sess, perr
 			}
 			err = perr
+			down = serverDown(resp.StatusCode)
 		} else {
 			cancel()
 		}
 		if u.ctx.Err() != nil {
 			return nil, ctxError(u.ctx, "Upload")
 		}
-		if attempt >= createAttempts {
+		if failing.IsZero() {
+			failing = time.Now()
+		}
+		if (!down && attempt >= createAttempts) || time.Since(failing) > resumeGiveUp {
 			return nil, fmt.Errorf("Upload failed: %w", err)
 		}
 		wait := jittered(pause)

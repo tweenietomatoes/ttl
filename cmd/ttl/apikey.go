@@ -257,7 +257,7 @@ func activateWithKey(key, server string) error {
 		return err
 	}
 	plan := ""
-	limits, err := fetchLimits(newConn(), server, key)
+	limits, err := fetchLimits(newConn(), server, key, 0)
 	switch {
 	case err == nil:
 		plan, _ = limits["plan"].(string)

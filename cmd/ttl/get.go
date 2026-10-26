@@ -90,23 +90,15 @@ func runGet(args []string) error {
 	hc := newConn()
 
 	// --- probe: fetch header + metadata, verify password ---
-	const probeTimeout = 30 * time.Second
-	probeCtx, probeCancel := context.WithTimeout(context.Background(), probeTimeout)
-	defer probeCancel()
-
 	probeURL, err := url.JoinPath(baseURL, "v1", "probe", token)
 	if err != nil {
 		return fmt.Errorf("Invalid URL: %w", err)
 	}
-	probeReq, err := newRequest(probeCtx, http.MethodGet, probeURL, nil)
-	if err != nil {
-		return err
-	}
-	setAPIKeyHeader(probeReq.Header, apiKey)
-	probeResp, err := hc.do(probeReq)
+	probeResp, probeCancel, err := getWhileDown(hc, probeURL, apiKey, probeTimeout, downMax)
 	if err != nil {
 		return fmt.Errorf("Probe failed: %w", err)
 	}
+	defer probeCancel()
 
 	// Check status before closing body: handleHTTPError reads it
 	if probeResp.StatusCode != http.StatusOK {
@@ -212,12 +204,20 @@ func runGet(args []string) error {
 	var lost error
 	resp, err := open(dlCtx, 0, "")
 	switch {
-	case err != nil && (mine == "" || dlCtx.Err() != nil):
+	case err != nil && dlCtx.Err() != nil:
 		return fmt.Errorf("Download failed: %w", err)
 	case err != nil:
-		// No answer: the download may have started all the same. It is
+		// No answer: asked again as for a broken connection (resumingBody).
+		// A one-time file's download may have started all the same: it is
 		// carried on with this client's ticket, from byte 0.
 		ticket, lost = mine, err
+	case serverDown(resp.StatusCode):
+		// The server restarting (a restart or a reboot of the machine takes
+		// a minute or two) or its storage: asked again the same way, as the
+		// same new download (nothing started: a one-time file's ticket,
+		// mine, is sent again as its own).
+		lost = statusCause(resp.StatusCode, readDetail(resp))
+		_ = resp.Body.Close()
 	case resp.StatusCode != http.StatusOK:
 		defer resp.Body.Close()
 		return handleHTTPError(resp)
@@ -262,6 +262,10 @@ func runGet(args []string) error {
 	}
 	return nil
 }
+
+// probeTimeout: each try of the probe (getWhileDown asks again a server
+// that is down, for up to downMax).
+const probeTimeout = 30 * time.Second
 
 // ── Resumable download ──
 

@@ -136,6 +136,48 @@ func TestUpload_Parts_RetriesPartOn502(t *testing.T) {
 	}
 }
 
+// An upload started while the server restarts (503 for a while: the limits
+// it reads first, then more opening tries than another 5xx gets) goes once
+// it is back.
+func TestUpload_Parts_SessionOpensAfterRestart(t *testing.T) {
+	noKeys(t)
+	m := newMockAPI(t)
+	m.limitsHook = func(attempt int) int {
+		if attempt <= 2 {
+			return 503
+		}
+		return 0
+	}
+	m.createHook = func(attempt int) int {
+		if attempt <= createAttempts+2 {
+			return 503
+		}
+		return 0
+	}
+	payload := largePayload(t)
+	src := tempFileBytes(t, "big.bin", payload)
+	if got := sendAndGet(t, m, src); !bytes.Equal(got, payload) {
+		t.Fatal("content differs after the session opened late")
+	}
+	if m.sessionCalls != createAttempts+3 {
+		t.Fatalf("session requests = %d, want %d", m.sessionCalls, createAttempts+3)
+	}
+}
+
+// Another 5xx when opening the session is tried a few times only.
+func TestUpload_Parts_SessionRefused500(t *testing.T) {
+	noKeys(t)
+	m := newMockAPI(t)
+	m.createHook = func(int) int { return 500 }
+	src := tempFileBytes(t, "big.bin", largePayload(t))
+	if err := runSend([]string{"-p", "resume-pass", "-server", m.URL, src}); err == nil {
+		t.Fatal("expected the upload to fail")
+	}
+	if m.sessionCalls != createAttempts {
+		t.Fatalf("session requests = %d, want %d", m.sessionCalls, createAttempts)
+	}
+}
+
 func TestUpload_Parts_RetriesPartOn408Stall(t *testing.T) {
 	noKeys(t)
 	m := newMockAPI(t)

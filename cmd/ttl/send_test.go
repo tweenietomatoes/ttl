@@ -29,6 +29,7 @@ func TestHumanBytes(t *testing.T) {
 		{1572864, "1.5 MB"},
 		{1073741824, "1.0 GB"},
 		{2147483648, "2.0 GB"},
+		{1099511627776, "1.0 TB"},
 	}
 	for _, tc := range cases {
 		got := humanBytes(tc.input)

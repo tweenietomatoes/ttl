@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"net/url"
@@ -59,7 +60,7 @@ var (
 	// files in parts.
 	singleMaxBytes int64 = 16 << 20
 	retryBase            = time.Second
-	partMinGap           = 400 * time.Millisecond // between requests: the edge allows 30 per 10 s
+	partMinGap           = 400 * time.Millisecond // between requests: well under the edge's 300 per 10 s
 	resumeGiveUp         = 15 * time.Minute       // an upload with no progress this long gives up
 	// An attempt whose bytes stopped moving for partIdle is given up (the
 	// connection died without saying so; the server drops a silent request
@@ -113,6 +114,7 @@ type uploader struct {
 	burn         bool
 	uploaderOnly bool
 	prog         *progress
+	sum          hash.Hash  // the file's SHA-256, taken as it is encrypted (encryptTo)
 	mu           sync.Mutex // guards nextStart: parts go up concurrently
 	nextStart    time.Time  // earliest start of the next request (partMinGap)
 	oneAtATime   atomic.Bool
@@ -157,9 +159,10 @@ func (u *uploader) setHeaders(h http.Header) {
 
 // encryptTo writes the encrypted stream into pw and closes it with the
 // outcome. The file is read up to its size at start: one that grew is cut
-// there, one that shrank fails the upload.
+// there, one that shrank fails the upload. What is read is hashed on the
+// way (u.sum): the fingerprint costs no second read.
 func (u *uploader) encryptTo(pw *io.PipeWriter) error {
-	cr := &countingReader{r: io.LimitReader(u.file, u.fileSize)}
+	cr := &countingReader{r: io.TeeReader(io.LimitReader(u.file, u.fileSize), u.sum)}
 	err := crypto.EncryptStream(pw, cr, u.name, uint64(u.fileSize), u.key, u.salt) //nolint:gosec // non-negative file size
 	if err == nil && cr.n != u.fileSize {
 		err = fmt.Errorf("File changed while uploading (expected %d bytes, read %d)", u.fileSize, cr.n)
@@ -173,10 +176,17 @@ func (u *uploader) startEncrypt() (*io.PipeReader, <-chan error, error) {
 	if _, err := u.file.Seek(0, io.SeekStart); err != nil {
 		return nil, nil, fmt.Errorf("Cannot read file: %w", err)
 	}
+	u.sum = sha256.New()
 	pr, pw := io.Pipe()
 	errCh := make(chan error, 1)
 	go func() { errCh <- u.encryptTo(pw) }()
 	return pr, errCh, nil
+}
+
+// fingerprint is the file's SHA-256, of the bytes the upload that has just
+// succeeded encrypted: all of the file, read once.
+func (u *uploader) fingerprint() []byte {
+	return u.sum.Sum(nil)
 }
 
 // stopEncrypt closes the pipe so a blocked encryptor exits, and returns

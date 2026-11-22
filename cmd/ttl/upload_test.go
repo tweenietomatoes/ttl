@@ -658,6 +658,10 @@ func TestUpload_Single_CutOffAnswerAskedAgain(t *testing.T) {
 			writeMockLimits(w)
 			return
 		}
+		if r.URL.Path != "/v1/files" { // the upload's manifest (fingerprint.go)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		io.Copy(io.Discard, r.Body)
 		puts++
 		w.Header().Set("Content-Length", "200")

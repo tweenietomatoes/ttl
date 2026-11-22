@@ -339,6 +339,20 @@ func TestCLI_Get_404(t *testing.T) {
 	}
 }
 
+func TestCLI_Get_Disabled(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(410)
+		json.NewEncoder(w).Encode(map[string]any{"detail": "This link has been disabled", "code": "LINK_DISABLED"})
+	}))
+	defer srv.Close()
+
+	err := runGet([]string{"-p", "12345678", srv.URL + "/aBcDeFgHiJ"})
+	if err == nil || strings.Contains(err.Error(), "Server error") ||
+		!strings.Contains(err.Error(), "This link has been disabled") || !strings.Contains(err.Error(), "Request a review") {
+		t.Fatalf("expected the disabled link's words, got: %v", err)
+	}
+}
+
 func TestCLI_Get_500(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(500)

@@ -85,8 +85,17 @@ func runGet(args []string) error {
 		return err
 	}
 
-	// Sent on probe + download; needed for uploader-only files, harmless otherwise.
+	// Sent on probe + download; needed for uploader-only files, harmless
+	// otherwise. Only to the hosts keyHost names: a link can name any host,
+	// and one made to look like ours would be handed the Orbit key.
 	apiKey := loadAPIKey()
+	if apiKey != "" && !keyHost(baseURL, serverVal) {
+		apiKey = ""
+		if !jsonMode {
+			fmt.Fprintf(os.Stderr, "%sYour Orbit key is not sent to %s; it goes only to ttl.space and its links' domain, or the --server address%s\n",
+				c(cGray), stripControl(strings.TrimPrefix(strings.TrimPrefix(baseURL, "https://"), "http://")), c(cReset))
+		}
+	}
 	hc := newConn()
 
 	// --- probe: fetch header + metadata, verify password ---
@@ -94,6 +103,10 @@ func runGet(args []string) error {
 	if err != nil {
 		return fmt.Errorf("Invalid URL: %w", err)
 	}
+	// The upload's manifest, the sender's fingerprints (fingerprint.go),
+	// comes after the header and the metadata; a server that keeps none
+	// answers as before.
+	probeURL += "?manifest=1"
 	probeResp, probeCancel, err := getWhileDown(hc, probeURL, apiKey, probeTimeout, downMax)
 	if err != nil {
 		return fmt.Errorf("Probe failed: %w", err)
@@ -108,8 +121,9 @@ func runGet(args []string) error {
 	// A one-time file says so in the probe's answer.
 	oneTime := probeResp.Header.Get("X-Burn-Starts") != ""
 
-	// Read probe data into memory (header + metadata, max 314 bytes)
-	probeData, err := io.ReadAll(io.LimitReader(probeResp.Body, int64(crypto.ProbeMaxBytes)+1))
+	// Read probe data into memory (header + metadata, max 314 bytes; then
+	// the manifest, if any, max 65,584)
+	probeData, err := io.ReadAll(io.LimitReader(probeResp.Body, int64(crypto.ProbeMaxBytes+crypto.ManifestMax)+1))
 	_ = probeResp.Body.Close()
 	if err != nil {
 		return fmt.Errorf("Probe read failed: %w", err)
@@ -130,11 +144,20 @@ func runGet(args []string) error {
 	// Verify the password by decrypting the metadata AEAD tag
 	probeFilename, probeFileSize, err := crypto.VerifyProbe(probeData, encKey)
 	if err != nil {
+		// A file with recipient passwords (X-Personal): a recipient's own
+		// password opens it on the link's page only; here it reads as a
+		// wrong one.
+		if probeResp.Header.Get("X-Personal") == "1" {
+			return fmt.Errorf("%w\nIf the sender gave you a password of your own for this file, open the link in a browser: ttl get does not open those", err)
+		}
 		return err
 	}
 	if !jsonMode {
 		fmt.Fprintf(os.Stderr, "%sPassword verified%s\n", c(cGreen), c(cReset))
 	}
+	// What the saved file is held to: the sender's fingerprints, if the
+	// manifest is there and opens with this file's key.
+	theirs := senderSums(encKey, token, crypto.ProbeTail(probeData))
 
 	// Derive download token for the authenticated download
 	downloadToken, err := crypto.DeriveDownloadToken(encKey)
@@ -228,7 +251,8 @@ func runGet(args []string) error {
 	prog := newProgress(encTotal, int64(probeFileSize), jsonMode) //nolint:gosec // file size is capped at 1 TB by parseMetadata, fits int64
 	body := &resumingBody{ctx: dlCtx, open: open, body: first, total: encTotal, prog: prog, ticket: ticket, oneTime: ticket != "", broken: lost, mine: mine}
 	defer func() { _ = body.Close() }()
-	origName, filename, written, err := crypto.DecryptStreamWithKey(prog.reader(body), encKey, outputDir)
+	fp := newDownloadFingerprint(probeFilename, theirs)
+	origName, filename, written, err := crypto.DecryptStreamTap(prog.reader(body), encKey, outputDir, fp)
 	prog.finish()
 	if err != nil {
 		if body.failure != nil {
@@ -236,6 +260,7 @@ func runGet(args []string) error {
 		}
 		return err
 	}
+	prints := fingerprintOf(fp, theirs)
 
 	if jsonMode {
 		savedTo, _ := filepath.Abs(filepath.Join(outputDir, filename))
@@ -246,7 +271,8 @@ func runGet(args []string) error {
 			Size             int64  `json:"size"`
 			SavedTo          string `json:"saved_to"`
 			OriginalFilename string `json:"original_filename,omitempty"`
-		}{true, token, filename, written, savedTo, ""}
+			fingerprintJSON
+		}{true, token, filename, written, savedTo, "", prints.json()}
 		if filename != origName {
 			out.OriginalFilename = origName
 		}
@@ -259,6 +285,7 @@ func runGet(args []string) error {
 			c(cGold), c(cReset),
 			c(cBold, cTeal), filename, c(cReset),
 			c(cGray), humanBytes(written), c(cReset))
+		prints.print()
 	}
 	return nil
 }
@@ -545,6 +572,36 @@ func parseURL(raw string) (token, baseURL string, err error) {
 	return token, baseURL, nil
 }
 
+// keyDomains: the domains a download sends the Orbit key to, with their
+// subdomains: the site and its links' own domain.
+var keyDomains = []string{"ttl.space", "ttlspaceusercontent.com"}
+
+// keyHost reports whether a download from base may carry the Orbit key:
+// base is on keyDomains, on the --server address (server) or on this
+// machine.
+func keyHost(base, server string) bool {
+	u, err := url.Parse(base)
+	if err != nil {
+		return false
+	}
+	h := strings.ToLower(u.Hostname())
+	if h == "" {
+		return false
+	}
+	if h == "localhost" || h == "127.0.0.1" || h == "::1" {
+		return true
+	}
+	if s, err := url.Parse(server); err == nil && strings.ToLower(s.Hostname()) == h {
+		return true
+	}
+	for _, d := range keyDomains {
+		if h == d || strings.HasSuffix(h, "."+d) {
+			return true
+		}
+	}
+	return false
+}
+
 // requireSecureScheme requires https for non-loopback hosts. http is
 // allowed only for localhost / 127.0.0.1 / ::1.
 func requireSecureScheme(u *url.URL) error {
@@ -605,10 +662,17 @@ func handleHTTPError(resp *http.Response) error {
 		return fmt.Errorf("Download refused: %s\nIf this is a private (uploader-only) file, the uploader's Orbit key must be active: ttl activate <key>", detail)
 	case http.StatusNotFound:
 		return fmt.Errorf("Link not found. The file may have expired, been downloaded already (burn after reading), or be private (uploader-only)")
+	case http.StatusGone, http.StatusUnavailableForLegalReasons:
+		// A disabled link: 410 for the operator's own decision, 451 for a
+		// legal demand, which the detail names.
+		if detail == "" {
+			detail = "This link has been disabled"
+		}
+		return fmt.Errorf("%s\nTo have the decision reviewed, open the link you were given in a browser and use \"Request a review\", or write to abuse@ttl.space", detail)
 	case http.StatusRequestTimeout:
 		return fmt.Errorf("Server timed out waiting for the client; try again")
 	case http.StatusTooManyRequests:
-		msg := "Rate limit exceeded — max 30 requests per 10s"
+		msg := "Rate limit exceeded"
 		if detail != "" {
 			msg = detail
 		}

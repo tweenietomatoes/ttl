@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -236,6 +237,14 @@ func runSend(args []string) error {
 	}
 	manageKey := stripControl(res.ManageKey)
 
+	// The file's fingerprint goes to the server sealed in the upload's
+	// manifest, for the recipient's client (fingerprint.go). It is sent
+	// before the result is printed, so a printed result means it is there
+	// or was given up; Ctrl-C meanwhile skips only it.
+	sum := up.fingerprint()
+	sendManifest(ctx, hc, serverVal, token, manageKey, key, sum)
+	sha := hex.EncodeToString(sum)
+
 	if jsonMode {
 		out := struct {
 			OK                  bool   `json:"ok"`
@@ -250,12 +259,13 @@ func runSend(args []string) error {
 			UploaderOnly        bool   `json:"uploader_only"`
 			IsPermanent         bool   `json:"is_permanent"`
 			ManageKey           string `json:"manage_key,omitempty"`
+			SHA256              string `json:"sha256"`
 			DailyBytesRemaining *int64 `json:"daily_bytes_remaining,omitempty"`
 			Password            string `json:"password,omitempty"`
 		}{
 			OK: true, Link: link, Token: token, Filename: name, Size: info.Size(), TTL: ttlVal,
 			Burn: burnVal, UploaderOnly: uploaderOnlyVal, IsPermanent: isPermanent,
-			ManageKey: manageKey, DailyBytesRemaining: res.DailyBytesRemaining,
+			ManageKey: manageKey, SHA256: sha, DailyBytesRemaining: res.DailyBytesRemaining,
 		}
 		if res.ExpiresIn > 0 {
 			out.ExpiresIn = res.ExpiresIn
@@ -286,7 +296,7 @@ func runSend(args []string) error {
 		fmt.Fprintf(os.Stderr, "%s, private — uploader's API key required to download%s", c(cBlue), c(cReset))
 	}
 	fmt.Fprintf(os.Stderr, "%s)%s\n", c(cGray), c(cReset))
-	fmt.Fprintf(os.Stderr, "%s%sIMPORTANT!%s %sSave your password — required to download and decrypt the file.%s\n",
+	fmt.Fprintf(os.Stderr, "%s%sKeep your password somewhere safe.%s %sWe can't see or recover it, and the file can't be opened without it.%s\n",
 		c(cAmber), c(cBold), c(cReset), c(cAmber), c(cReset))
 	if generated {
 		fmt.Fprintf(os.Stderr, "%sPassword:%s %s%s%s\n", c(cGray), c(cReset), c(cBold, cWhite), pass, c(cReset))
@@ -295,6 +305,7 @@ func runSend(args []string) error {
 		fmt.Fprintf(os.Stderr, "%sManage key:%s %s%s%s %s(ttl status / ttl delete -k)%s\n",
 			c(cGray), c(cReset), c(cBold, cWhite), manageKey, c(cReset), c(cGray), c(cReset))
 	}
+	fmt.Fprintf(os.Stderr, "%sSHA-256:%s %s%s%s\n", c(cGray), c(cReset), c(cWhite), sha, c(cReset))
 	fmt.Println(link)
 	return nil
 }
@@ -492,6 +503,8 @@ func parseTTL(label string) (int, bool, error) {
 
 func humanBytes(b int64) string {
 	switch {
+	case b >= 1<<40:
+		return fmt.Sprintf("%.1f TB", float64(b)/(1<<40))
 	case b >= 1<<30:
 		return fmt.Sprintf("%.1f GB", float64(b)/(1<<30))
 	case b >= 1<<20:

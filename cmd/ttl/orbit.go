@@ -59,10 +59,18 @@ func runPlan(args []string) error {
 		planColor = c(cBlue, cBold)
 	}
 	// Server-controlled string; strip ANSI/format chars before printing.
-	fmt.Fprintf(os.Stderr, "%sPlan:%s %s%s%s\n", c(cGray), c(cReset), planColor, stripControl(plan), c(cReset))
+	fmt.Fprintf(os.Stderr, "%sPlan:%s %s%s%s", c(cGray), c(cReset), planColor, stripControl(plan), c(cReset))
+	// Orbit for 30 days with no subscription: no permanent files, until
+	// pass_ends_at (unix seconds).
+	passEnds := jsonInt64(limits["pass_ends_at"])
+	if passEnds > 0 {
+		fmt.Fprintf(os.Stderr, " %s(30 days with no subscription, until %s)%s", c(cGray),
+			time.Unix(passEnds, 0).Format("2006-01-02 15:04 MST"), c(cReset))
+	}
+	fmt.Fprintln(os.Stderr)
 	fmt.Fprintf(os.Stderr, "%sMax file size:%s %s\n", c(cGray), c(cReset), humanBytes(jsonInt64(limits["max_file_bytes"])))
 	maxTTL := humanDuration(jsonInt64(limits["max_ttl_seconds"]))
-	if plan == "orbit" {
+	if plan == "orbit" && passEnds == 0 {
 		maxTTL += " (or permanent)"
 	}
 	fmt.Fprintf(os.Stderr, "%sMax TTL:%s %s\n", c(cGray), c(cReset), maxTTL)

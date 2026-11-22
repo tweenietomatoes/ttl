@@ -48,6 +48,14 @@ func DecryptStream(r io.Reader, password string, outDir string) (string, string,
 // Returns the original filename from metadata, the actual saved filename
 // (which may differ due to auto-rename), the number of bytes written, and any error.
 func DecryptStreamWithKey(r io.Reader, key []byte, outDir string) (string, string, int64, error) {
+	return DecryptStreamTap(r, key, outDir, nil)
+}
+
+// DecryptStreamTap is DecryptStreamWithKey that also hands tap, when there
+// is one, every byte it writes to the file, in order, right after writing
+// it: the download's fingerprint is taken on the way (fingerprint.go). A
+// tap never fails; what it returns is not looked at.
+func DecryptStreamTap(r io.Reader, key []byte, outDir string, tap io.Writer) (string, string, int64, error) {
 	// Read and check the header
 	header := make([]byte, HeaderSize)
 	if _, err := io.ReadFull(r, header); err != nil {
@@ -172,6 +180,9 @@ func DecryptStreamWithKey(r io.Reader, key []byte, outDir string) (string, strin
 		if _, err = out.Write(firstPlain); err != nil {
 			return "", "", 0, fmt.Errorf("Write failed: %w", err)
 		}
+		if tap != nil {
+			_, _ = tap.Write(firstPlain)
+		}
 		written += int64(len(firstPlain))
 	}
 
@@ -197,6 +208,9 @@ func DecryptStreamWithKey(r io.Reader, key []byte, outDir string) (string, strin
 		}
 		if _, err = out.Write(plaintext); err != nil {
 			return "", "", 0, fmt.Errorf("Write failed: %w", err)
+		}
+		if tap != nil {
+			_, _ = tap.Write(plaintext)
 		}
 		written += int64(len(plaintext))
 	}

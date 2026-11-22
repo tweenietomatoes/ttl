@@ -381,6 +381,23 @@ func TestPlan_JSON_FreeAndOrbit(t *testing.T) {
 	}
 }
 
+// Orbit for 30 days with no subscription says until when, and offers no
+// permanent files.
+func TestPlan_Pass(t *testing.T) {
+	orbitEnv(t)
+	m := newMockAPI(t)
+	m.plan = "orbit"
+	m.passEndsAt = 1797768000
+	out := captureStderr(t, func() {
+		if err := runPlan([]string{"-server", m.URL}); err != nil {
+			t.Errorf("plan: %v", err)
+		}
+	})
+	if !strings.Contains(out, "30 days with no subscription, until ") || strings.Contains(out, "or permanent") {
+		t.Fatalf("plan said %q", out)
+	}
+}
+
 func TestFetchLimits_KeyRejected(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(401)

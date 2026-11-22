@@ -50,20 +50,23 @@ No password provided. Generate one? [Y/n]: y
 Generated password: aB3kL9mXq7Rt
 4.2 MB / 4.2 MB  ·✧★◉✧··✧·✧★◉✧··✧·✧★◉✧··✧·✧★  100%  1.5 MB/s
 ·✧★◉ Thank goodness, secret.pdf is in orbit (4.2 MB, expires 2026-10-08 12:00)
-IMPORTANT! Save your password — required to download and decrypt the file.
+Keep your password somewhere safe. We can't see or recover it, and the file can't be opened without it.
 Password: aB3kL9mXq7Rt
 Manage key: k7Qm2vXpL9aR4tB8cD1eF6gH3jK5mN0oP2qS4uV7wYz (ttl status / ttl delete -k)
-https://ttl.space/aBcDeFgHiJ
+SHA-256: 8fa66ff10c5b1474ea1ade90a21ee9bebf6fae1ea62f8ac9bc1e58759d518f70
+https://ttlspaceusercontent.com/aBcDeFgHiJ
 ```
 
 Download using the full URL:
 
 ```
-$ ttl get https://ttl.space/aBcDeFgHiJ
+$ ttl get https://ttlspaceusercontent.com/aBcDeFgHiJ
 Enter password: ········
 Password verified
 4.2 MB / 4.2 MB  ·✧★◉✧··✧·✧★◉✧··✧·✧★◉✧··✧·✧★  100%  1.5 MB/s
 ◉★✧· Phew, secret.pdf landed safe and sound (4.2 MB)
+SHA-256: 8fa66ff10c5b1474ea1ade90a21ee9bebf6fae1ea62f8ac9bc1e58759d518f70
+✓ Same as the sender's fingerprint
 ```
 
 Or just the 10-character token — same result:
@@ -86,6 +89,8 @@ $ ttl get aBcDeFgHiJ
 Enter password: ········
 Password verified
 ◉★✧· Phew, confidential.pdf landed safe and sound (912.0 KB)
+SHA-256: 3b1f0c5e9a7d2468ace13579bdf02468ace13579bdf02468ace13579bdf02468
+✓ Same as the sender's fingerprint
 
 $ ttl get aBcDeFgHiJ
 Error: Link not found. The file may have expired, been downloaded already (burn after reading), or be private (uploader-only)
@@ -120,9 +125,13 @@ A dropped connection does not restart a transfer:
 - **Downloads** resume with a byte-range request from the last byte received; every 64 KiB chunk is authenticated on its own, so a resumed stream decrypts exactly like an unbroken one. A burn-after-reading file is used up once a download of it has reached its end. Until then a broken download carries on with its resume ticket, which the CLI draws itself before the first request, so even a first answer lost on the way is picked up again; another `ttl get` starts a new download.
 - **Ctrl-C** cancels cleanly: an open upload session is handed back to the server, and a partial download is removed.
 
+## 🧾 File fingerprints
+
+`ttl send` prints the file's SHA-256 and sends it to the server sealed in the upload's manifest, which only the password opens. `ttl get` takes the SHA-256 of what it saves and says whether it is the sender's: "✓ Same as the sender's fingerprint", or a warning to ask the sender. A package made on the web page is checked file by file. With nothing to compare (an upload from an older client, or one whose fingerprint could not be stored) it shows the SHA-256 without a verdict, and a download is never stopped over a fingerprint. In `--json`: `sha256` on send; `sha256` (or `files[]` for a package) and `same_as_sender` on get.
+
 ## 🪐 Orbit plan
 
-[Orbit](https://ttl.space/orbit) unlocks larger files, longer retention, permanent storage, uploader-only locks, and a 500 GB pool.
+[Orbit](https://ttl.space/orbit) unlocks larger files, longer retention, permanent storage, uploader-only locks, and a 1 TB pool.
 
 The Orbit key is auto-detected (first match wins):
 
@@ -130,7 +139,7 @@ The Orbit key is auto-detected (first match wins):
 2. `ttl.key` next to the binary
 3. `~/.ttl/key`
 
-When `ttl get` runs with a key configured, it is sent automatically so private (uploader-only) files open transparently.
+When `ttl get` runs with a key configured, it is sent automatically so private (uploader-only) files open transparently. The key goes only to `ttl.space` and `ttlspaceusercontent.com` (and their subdomains), the `--server` address and localhost; a link on any other host is downloaded without it.
 
 `ttl activate` checks the key against the server before saving it, so a mistyped or revoked key is refused on the spot. Prefer `--key-stdin` or `--key-file` over the positional form, which lands in shell history.
 
@@ -140,14 +149,14 @@ Orbit plan activated. Key saved to /usr/local/bin/ttl.key
 
 $ ttl plan
 Plan: orbit
-Max file size: 10.0 GB
+Max file size: 50.0 GB
 Max TTL: 30 days (or permanent)
 Uploads per day: 1000000
-Storage quota: 500.0 GB
+Storage quota: 1.0 TB
 
 Usage:
   Uploads today: 3
-  Active storage: 4.2 GB / 500.0 GB
+  Active storage: 4.2 GB / 1.0 TB
 
 $ ttl send -t 30d large-backup.tar.gz
 
@@ -156,9 +165,9 @@ $ ttl send -u -t permanent secrets.tar.zst
 
 $ ttl list
   xK9mQ2vLpA    4.2 MB  2026-03-16 10:30 → 2026-04-15 10:30  [active]
-  https://ttl.space/xK9mQ2vLpA
+  https://ttlspaceusercontent.com/xK9mQ2vLpA
   yL3nR7wKqB   12.5 MB  2026-04-20 09:12 → permanent          [active] [private]
-  https://ttl.space/yL3nR7wKqB
+  https://ttlspaceusercontent.com/yL3nR7wKqB
 
 $ ttl delete xK9mQ2vLpA
 Deleted: xK9mQ2vLpA
@@ -183,11 +192,13 @@ Error: Link not found. The file may have expired, been downloaded already (burn 
 $ ttl get aBcDeFgHiJ          # API key auto-loaded — opens fine
 Password verified
 ◉★✧· Phew, board-minutes.pdf landed safe and sound (240.0 KB)
+SHA-256: c2e8f4a6b0d1357924680ace13579bdf2468ace13579bdf0246813579bdface0
+✓ Same as the sender's fingerprint
 ```
 
 ### ♾️ Permanent storage
 
-`-t permanent` skips the TTL entirely. The file stays until you delete it or your subscription ends. After cancellation a 48-hour grace window arms before hard delete; `ttl plan` displays a red banner with the deadline.
+`-t permanent` skips the TTL entirely. The file stays until you delete it or your subscription ends. When the subscription ends, permanent files stay reachable for a grace period set out in the [Terms](https://ttl.space/terms), then close.
 
 ```
 $ ttl send -t permanent design-archive.zip
@@ -300,16 +311,18 @@ Password is resolved in this order (first match wins):
 
 Minimum password length is 8 characters. Only one explicit source (`-p`, `--password-stdin`, `--password-file`) can be used at a time. For scripts, prefer `--password-stdin` or `--password-file` over `-p`.
 
+A recipient password (one a sender set for you alone on the web page) opens the file in a browser only; `ttl get` says so when such a file does not open.
+
 ## 🤖 JSON mode (scripts & AI agents)
 
 `--json` makes ttl fully non-interactive — no prompts, no progress bars, just structured JSON on stdout. Designed for AI agents, CI/CD pipelines, and tool-use integrations.
 
 ```
 $ ttl --json send report.pdf
-{"ok":true,"link":"https://ttl.space/xK9mQ2vLpA","token":"xK9mQ2vLpA","filename":"report.pdf","size":2097152,"ttl":"7d","expires_in":604800,"expires_at":1760011200,"burn":false,"uploader_only":false,"is_permanent":false,"manage_key":"k7Qm2vXpL9aR4tB8cD1eF6gH3jK5mN0oP2qS4uV7wYz","password":"aB3kL9mXq7Rt"}
+{"ok":true,"link":"https://ttlspaceusercontent.com/xK9mQ2vLpA","token":"xK9mQ2vLpA","filename":"report.pdf","size":2097152,"ttl":"7d","expires_in":604800,"expires_at":1760011200,"burn":false,"uploader_only":false,"is_permanent":false,"manage_key":"k7Qm2vXpL9aR4tB8cD1eF6gH3jK5mN0oP2qS4uV7wYz","sha256":"8fa66ff10c5b1474ea1ade90a21ee9bebf6fae1ea62f8ac9bc1e58759d518f70","password":"aB3kL9mXq7Rt"}
 
 $ ttl --json get -p aB3kL9mXq7Rt xK9mQ2vLpA
-{"ok":true,"token":"xK9mQ2vLpA","filename":"report.pdf","size":2097152,"saved_to":"/home/user/report.pdf"}
+{"ok":true,"token":"xK9mQ2vLpA","filename":"report.pdf","size":2097152,"saved_to":"/home/user/report.pdf","sha256":"8fa66ff10c5b1474ea1ade90a21ee9bebf6fae1ea62f8ac9bc1e58759d518f70","same_as_sender":true}
 
 $ ttl --json status xK9mQ2vLpA -k k7Qm2vXpL9aR4tB8cD1eF6gH3jK5mN0oP2qS4uV7wYz
 {"ok":true,"token":"xK9mQ2vLpA","status":{"state":"active","size_bytes":2097152,"created_at":1759406400,"expires_at":1760011200,"permanent":false,"burn":false,"note":false,"uploader_only":false,"downloads":1,"last_download_at":1759492800,"part_reads":0,"last_part_at":0}}
@@ -374,16 +387,16 @@ Limits are fetched from the server at upload time and depend on your plan.
 
 | Limit | Free | Orbit |
 |-------|------|-------|
-| Max file size | 2 GB | 10 GB |
-| Max retention | 7 days | 30 days, or permanent |
-| Uploads per day | 10 | effectively unlimited |
-| Upload volume per day (per IP) | 10 GB | unlimited |
-| Storage quota | — | 500 GB (expandable) |
+| Max file size | 6 GB | 50 GB |
+| Max retention | 7 days | 30 days, or permanent (monthly plan) |
+| Uploads per day (per IP) | 4 | effectively unlimited |
+| Upload volume per day (per IP) | 6 GB | unlimited |
+| Storage quota | — | 1 TB (expandable) |
 | Delete | with the manage key | ✓ |
 | List | — | ✓ |
 | Uploader-only (private) | — | ✓ |
 | Min password | 8 characters | 8 characters |
-| Requests per IP | 30 per 10 seconds | 30 per 10 seconds |
+| Requests per IP | 300 per 10 seconds | 300 per 10 seconds |
 
 ## 📖 Documentation
 

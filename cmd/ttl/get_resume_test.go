@@ -444,6 +444,46 @@ func TestGet_SendsUserAgentAndKey(t *testing.T) {
 	}
 }
 
+// The Orbit key goes to ttl.space and its links' domain (subdomains too),
+// the --server address and this machine, never to a host that only looks
+// like ours.
+func TestKeyHost(t *testing.T) {
+	for _, c := range []struct {
+		base, server string
+		want         bool
+	}{
+		{"https://ttl.space", "https://ttl.space", true},
+		{"https://ttlspaceusercontent.com", "https://ttl.space", true},
+		{"https://staging.ttl.space", "https://ttl.space", true},
+		{"https://TTL.SPACE", "https://ttl.space", true},
+		{"https://ttl.space.example.com", "https://ttl.space", false},
+		{"https://evilttl.space", "https://ttl.space", false},
+		{"https://example.com", "https://ttl.space", false},
+		{"https://example.com", "https://example.com", true},
+		{"http://127.0.0.1:8080", "https://ttl.space", true},
+	} {
+		if got := keyHost(c.base, c.server); got != c.want {
+			t.Errorf("keyHost(%q, %q) = %v", c.base, c.server, got)
+		}
+	}
+}
+
+// A file with recipient passwords: a password that does not open it says
+// that a recipient's own password opens it in a browser only.
+func TestGet_RecipientPassword(t *testing.T) {
+	noKeys(t)
+	m := newMockAPI(t)
+	src := tempFile(t, "x.txt", "recipient")
+	if err := runSend([]string{"-p", "main-password", "-server", m.URL, src}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	m.personal = true
+	err := runGet([]string{"-p", "recipient-pw", "-o", t.TempDir(), m.URL + "/aBcDeFgHiJ"})
+	if err == nil || !strings.Contains(err.Error(), "wrong password") || !strings.Contains(err.Error(), "open the link in a browser") {
+		t.Fatalf("got %v", err)
+	}
+}
+
 func TestGet_BareTokenUsesServerFlag(t *testing.T) {
 	noKeys(t)
 	m := newMockAPI(t)

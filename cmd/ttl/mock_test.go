@@ -28,7 +28,9 @@ type mockAPI struct {
 
 	mu sync.Mutex
 
-	plan string // "free" (default) or "orbit"
+	plan       string // "free" (default) or "orbit"
+	passEndsAt int64  // with orbit: a 30-day pass's end (pass_ends_at)
+	personal   bool   // the probe says the file has recipient passwords
 
 	// Uploads
 	blob              []byte // ciphertext of the last completed upload
@@ -163,7 +165,7 @@ func (m *mockAPI) problem(w http.ResponseWriter, status int, detail string) {
 
 func (m *mockAPI) limits(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
-	plan := m.plan
+	plan, passEnds := m.plan, m.passEndsAt
 	m.limitsCalls++
 	hook, attempt := m.limitsHook, m.limitsCalls
 	m.mu.Unlock()
@@ -178,7 +180,7 @@ func (m *mockAPI) limits(w http.ResponseWriter, r *http.Request) {
 			m.problem(w, 401, "Invalid API key format")
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]any{
+		resp := map[string]any{
 			"plan": "orbit", "max_file_bytes": 10737418240, "max_ttl_seconds": 2592000,
 			"default_ttl_seconds": 86400, "uploads_per_day": 1000000,
 			"allowed_ttl_seconds": []int{300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 259200, 345600, 432000, 518400, 604800, 1209600, 1296000, 2419200, 2592000},
@@ -186,7 +188,11 @@ func (m *mockAPI) limits(w http.ResponseWriter, r *http.Request) {
 			"storage_quota_bytes": 536870912000, "storage_addons": 0,
 			"usage":               map[string]any{"uploads_today": 3, "active_storage_bytes": 4294967296},
 			"cancel_scheduled_at": 0, "perm_grace_until": 0,
-		})
+		}
+		if passEnds > 0 {
+			resp["pass_ends_at"] = passEnds
+		}
+		json.NewEncoder(w).Encode(resp)
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]any{
@@ -423,7 +429,7 @@ func (m *mockAPI) abort(w http.ResponseWriter, r *http.Request) {
 
 func (m *mockAPI) probe(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
-	blob, burn := m.blob, m.burn
+	blob, burn, personal := m.blob, m.burn, m.personal
 	m.probeCalls++
 	hook, attempt := m.probeHook, m.probeCalls
 	m.mu.Unlock()
@@ -440,6 +446,9 @@ func (m *mockAPI) probe(w http.ResponseWriter, r *http.Request) {
 	if burn {
 		w.Header().Set("X-Burn-Started", "0")
 		w.Header().Set("X-Burn-Starts", "5")
+	}
+	if personal {
+		w.Header().Set("X-Personal", "1")
 	}
 	n := min(len(blob), 314)
 	w.Header().Set("Content-Type", "application/octet-stream")
